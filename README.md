@@ -40,17 +40,24 @@ on the active note. The plugin:
    | `ol-branch`    | `obsidian/my-post`                                        |
    | `ol-pr-url`    | `https://github.com/open-lakehouse/openlakehouse-io/pull/123` |
    | `ol-pr-number` | `123`                                                     |
-   | `ol-files`     | every repository path uploaded (index.mdx and images)     |
+   | `ol-files`     | every uploaded file as `{path, sha}` (git blob sha of the upload) |
    | `ol-date`      | `2026-11-23` (only when the note has no `date`, to pin it) |
 
 Running the command again updates the same branch and pull request. If the
 pull request was closed or merged, a new one is opened from the same branch.
 
-On re-publish, files the plugin uploaded before (listed in `ol-files`, plus the
-`ol-path` index.mdx) that are no longer part of the post are deleted from the
-branch: removed images, a removed `thumbnail.*`, and the old directory's files
-after a slug or category change. Files the plugin didn't upload are never
-deleted.
+On re-publish, files from a previous publish that are no longer part of the
+post (a removed image or `thumbnail.*`, or the old directory's files after a
+slug or category change) are deleted from the branch, **but only if the plugin
+can prove it owns them**: `ol-files` records the git blob sha GitHub returned
+for each upload, and a file is deleted only while the branch still holds
+exactly that blob. A file that was changed on the branch (e.g. a maintainer
+edited it after the pull request was merged), or whose recorded sha doesn't
+match (e.g. a hand-edited `ol-files`), is left alone. So are entries without a
+sha: the plain-path `ol-files` lists written by earlier versions of the plugin
+and `ol-path`. Files left alone are listed in a notice after publishing, so
+you can remove them in the pull request yourself. Only paths under
+`src/content/posts/` are ever considered.
 
 When publishing from a fork whose base branch is behind the target, the plugin
 syncs the fork's base branch (GitHub's "Sync fork") so that new post branches
