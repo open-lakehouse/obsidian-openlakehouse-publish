@@ -288,11 +288,37 @@ describe("GitHubGateway", () => {
         expect(result.deletesSkipped).to.deep.equal([png]);
         expect(result.filesDeleted).to.be.empty;
         expect(github.file(TARGET, "obsidian/my-post", png)!.sha).to.equal("e".repeat(40));
+        expect(github.nextDeleteResponse).to.be.undefined;
       });
     }
 
-    it("fails with the original GitHub error when a 422 delete leaves the same blob", async () => {
-      github.nextDeleteResponse = { status: 422, message: "Validation Failed" };
+    for (const status of [409, 422]) {
+      it(`fails with the original GitHub error when a ${status} delete leaves the same blob`, async () => {
+        github.nextDeleteResponse = { status, message: "Validation Failed" };
+        const error = await gateway()
+          .publishPost(
+            input({ files: [input().files[0]], deleteFiles: [{ path: png, sha: first.fileShas[png] }] }),
+          )
+          .catch((e) => e);
+        expect(error).to.be.instanceOf(GitHubError);
+        expect(error.status).to.equal(status);
+        expect(error.message).to.equal(
+          `GitHub: deleting ${png} failed (${status}): Validation Failed`,
+        );
+        expect(github.file(TARGET, "obsidian/my-post", png)!.sha).to.equal(first.fileShas[png]);
+        expect(github.requestsMatching("POST", `/repos/${TARGET}/pulls`)).to.be.empty;
+        expect(github.nextDeleteResponse).to.be.undefined;
+      });
+    }
+
+    it("preserves the delete error when the post-delete refetch fails", async () => {
+      github.nextDeleteResponse = {
+        status: 422,
+        message: "Validation Failed",
+        mutate: () => {
+          github.nextGetResponse = { status: 503, message: "Service Unavailable" };
+        },
+      };
       const error = await gateway()
         .publishPost(
           input({ files: [input().files[0]], deleteFiles: [{ path: png, sha: first.fileShas[png] }] }),
@@ -303,8 +329,8 @@ describe("GitHubGateway", () => {
       expect(error.message).to.equal(
         `GitHub: deleting ${png} failed (422): Validation Failed`,
       );
-      expect(github.file(TARGET, "obsidian/my-post", png)!.sha).to.equal(first.fileShas[png]);
-      expect(github.requestsMatching("POST", `/repos/${TARGET}/pulls`)).to.be.empty;
+      expect(github.nextDeleteResponse).to.be.undefined;
+      expect(github.nextGetResponse).to.be.undefined;
     });
 
     it("skips paths that don't exist on the branch, and never deletes a path being written", async () => {

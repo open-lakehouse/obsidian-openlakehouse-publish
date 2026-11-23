@@ -536,6 +536,7 @@ describe("Publisher", () => {
 
       const result = await p.publish(file);
 
+      expect(github.nextDeleteResponse).to.be.undefined;
       expect(result.filesDeleted).to.be.empty;
       expect(result.deletesSkipped).to.be.empty;
       expect(github.file(TARGET, "obsidian/race", path)).to.be.undefined;

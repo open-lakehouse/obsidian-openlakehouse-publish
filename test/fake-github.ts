@@ -47,6 +47,11 @@ type DeleteResponse = {
   mutate?: (files: FakeFileMap, path: string) => void;
 };
 
+type GetResponse = {
+  status: number;
+  message: string;
+};
+
 let shaCounter = 1;
 const nextSha = () => (shaCounter++).toString(16).padStart(40, "0");
 
@@ -60,6 +65,8 @@ export class FakeGitHub {
   forkReadyAfter = 0;
   /** One-shot DELETE response used to simulate races in gateway tests. */
   nextDeleteResponse?: DeleteResponse;
+  /** One-shot contents GET response used to simulate refetch failures. */
+  nextGetResponse?: GetResponse;
   private forkLookups = 0;
 
   addRepo(fullName: string, opts: Partial<FakeRepo> = {}) {
@@ -238,6 +245,11 @@ export class FakeGitHub {
       if (!repo) return this.respond(404, { message: "Not Found" });
       const filePath = decodeURIComponent(m[3]);
       if (method === "GET") {
+        if (this.nextGetResponse) {
+          const response = this.nextGetResponse;
+          this.nextGetResponse = undefined;
+          return this.respond(response.status, { message: response.message });
+        }
         const branch = url.searchParams.get("ref") || "main";
         const f = repo.files[branch]?.[filePath];
         if (!f) return this.respond(404, { message: "Not Found" });
@@ -264,7 +276,7 @@ export class FakeGitHub {
       }
       if (method === "DELETE") {
         if (!repo.push) return this.respond(403, { message: "Resource not accessible" });
-        const files = repo.files[body.branch];
+        const files = (repo.files[body.branch] ||= {});
         if (this.nextDeleteResponse) {
           const response = this.nextDeleteResponse;
           this.nextDeleteResponse = undefined;
