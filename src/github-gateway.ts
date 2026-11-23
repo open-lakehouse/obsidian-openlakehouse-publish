@@ -48,6 +48,7 @@ export type GitHubGatewayOptions = {
 };
 
 type ApiResult = { status: number; json: any };
+type RemoteClassification = "missing" | "changed" | "same";
 
 const encodePath = (path: string) =>
   path.split("/").map(encodeURIComponent).join("/");
@@ -123,6 +124,18 @@ export default class GitHubGateway implements PublishGateway {
       );
     }
     return r.json;
+  }
+
+  private async classifyRemote(
+    remote: ApiResult,
+    path: string,
+    sha: string,
+  ): Promise<RemoteClassification> {
+    if (remote.status === 404) {
+      return "missing";
+    }
+    const json = await this.expect(Promise.resolve(remote), `reading ${path}`, [200]);
+    return !json || Array.isArray(json) || json.sha !== sha ? "changed" : "same";
   }
 
   async resolveHeadRepo(): Promise<RepoRef> {
@@ -327,13 +340,9 @@ export default class GitHubGateway implements PublishGateway {
       "GET",
       `${contentsPath}?ref=${encodeURIComponent(branch)}`,
     );
-    if (existing.status === 404) {
-      return "missing";
-    }
-    const json = await this.expect(Promise.resolve(existing), `reading ${file.path}`, [200]);
-    // Never delete a directory (listing is an array) or modified content
-    if (!json || Array.isArray(json) || json.sha !== file.sha) {
-      return "changed";
+    const existingState = await this.classifyRemote(existing, file.path, file.sha);
+    if (existingState !== "same") {
+      return existingState;
     }
     const result = await this.api("DELETE", contentsPath, {
       message: `Remove ${file.path.split("/").pop()} for "${postTitle}"`,
@@ -346,16 +355,15 @@ export default class GitHubGateway implements PublishGateway {
         "GET",
         `${contentsPath}?ref=${encodeURIComponent(branch)}`,
       );
-      if (current.status === 404) {
-        return "missing";
+      let currentState: RemoteClassification;
+      try {
+        currentState = await this.classifyRemote(current, file.path, file.sha);
+      } catch {
+        await this.expect(Promise.resolve(result), `deleting ${file.path}`, [200]);
+        throw new Error("unreachable");
       }
-      const currentJson = await this.expect(
-        Promise.resolve(current),
-        `reading ${file.path}`,
-        [200],
-      );
-      if (!currentJson || Array.isArray(currentJson) || currentJson.sha !== file.sha) {
-        return "changed";
+      if (currentState !== "same") {
+        return currentState;
       }
     }
     await this.expect(Promise.resolve(result), `deleting ${file.path}`, [200]);
