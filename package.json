@@ -1,7 +1,7 @@
 {
-  "name": "obsidian-sample-plugin",
-  "version": "0.11.2",
-  "description": "Obsidian plugin to publish obsidian notes to DEV",
+  "name": "publish-to-openlakehouse",
+  "version": "0.1.0",
+  "description": "Obsidian plugin to publish notes as MDX posts to openlakehouse.io via GitHub pull requests",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
@@ -17,13 +17,15 @@
     "spec": "test/**/*.ts"
   },
   "keywords": [],
-  "author": "",
+  "author": "Open Lakehouse contributors (based on obsidian-dev-publish by Peter Strøiman)",
   "license": "MIT",
   "devDependencies": {
+    "@mdx-js/mdx": "^3",
     "@types/chai": "^4.3.16",
     "@types/chai-as-promised": "^7.1.8",
     "@types/chai-like": "^1.1.3",
     "@types/fetch-mock": "^7.3.8",
+    "@types/mdast": "^4",
     "@types/mocha": "^10.0.7",
     "@types/node": "^16.18.103",
     "@types/node-fetch": "^2.6.11",
@@ -45,10 +47,17 @@
     "mocha": "^10.7.0",
     "node-fetch": "^3.3.2",
     "obsidian": "latest",
+    "remark-frontmatter": "^5",
+    "remark-gfm": "^4",
     "sinon": "^18.0.0",
     "sinon-chai": "^3.7.0",
     "tslib": "2.4.0",
     "tsx": "^4.16.2",
     "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "mdast-util-from-markdown": "^2",
+    "mdast-util-gfm": "^3",
+    "micromark-extension-gfm": "^3"
   }
 }

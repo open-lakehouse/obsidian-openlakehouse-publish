@@ -20,6 +20,7 @@ export interface GenericFileManager<TFile> {
 
 export interface GenericVault<TFile> {
   read(file: TFile): Promise<string>;
+  readBinary(file: TFile): Promise<ArrayBuffer>;
 }
 
 export interface GetFrontMatterInfo {

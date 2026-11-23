@@ -1,220 +1,204 @@
-# Obsidian publish note to DEV
+# Publish to OpenLakehouse
 
-Obsidian plugin that allows you to publish notes as articles on DEV (https://dev.to)
+Obsidian plugin that publishes a note as a blog post on
+[openlakehouse.io](https://openlakehouse.io).
 
-> [!NOTE]
-> Articles are created in a draft state on DEV, so you can properly review them
-> before making them public.
+openlakehouse.io is a static MDX site with no CMS or write API. Posts live in
+the GitHub repository
+[`open-lakehouse/openlakehouse-io`](https://github.com/open-lakehouse/openlakehouse-io)
+at `src/content/posts/<category>/<slug>/index.mdx`, with images co-located next
+to the MDX file. Publishing therefore means: convert the note to MDX, commit it
+(and its images) to a branch, and open a pull request. A maintainer reviews and
+merges the PR, and the site deploys.
 
 > [!CAUTION]
-> This plugin stores your DEV api key unencrypted in the plugin configuration
-> file, stored as part of your obsidian vault. If you don't fully understand the
-> implications of this, don't use this plugin.
->
-> This is important, I will repeat: Don't use this plugin if you don't fully
-> understand the security implications!
+> This plugin stores your GitHub token unencrypted in the plugin configuration
+> file, stored as part of your Obsidian vault. If you don't fully understand the
+> implications of this, don't use this plugin. Use a token with the smallest
+> possible scope and an expiry date.
 
-## Implemented features
+## What it does
 
-- Create a new article on DEV when running on the active note.
-- Update the article on DEV with changes made since first creation.
-- Title of the article is the first H1 heading in the not.
-- Body of the article is everything _after_ the first H1 in the note.
-- Resolve the `url` metadata of linked attributes.
-- After creating a note, add a link in the frontmatter
+Run the command **Publish to OpenLakehouse: Create/update OpenLakehouse post**
+on the active note. The plugin:
 
-## Usage
+1. Converts the note to MDX (see [Conversion](#conversion)).
+2. Picks the repository to push to (the _head repository_): the configured
+   head repository; otherwise the target repository if your token can push to
+   it; otherwise your fork of the target repository (created if needed).
+3. Creates the branch `obsidian/<slug>` from the base branch (default `main`),
+   unless it already exists.
+4. Writes `index.mdx` and every embedded image to
+   `src/content/posts/<category>/<slug>/` on that branch with the GitHub
+   Contents API. Unchanged files are skipped.
+5. Opens a pull request against the target repository, or reuses the open one.
+6. Writes the result back into the note's frontmatter:
 
-### Tags
+   | Key            | Example                                                   |
+   | -------------- | --------------------------------------------------------- |
+   | `ol-path`      | `src/content/posts/iceberg/my-post/index.mdx`             |
+   | `ol-branch`    | `obsidian/my-post`                                        |
+   | `ol-pr-url`    | `https://github.com/open-lakehouse/openlakehouse-io/pull/123` |
+   | `ol-pr-number` | `123`                                                     |
+   | `ol-files`     | every uploaded file as `{path, sha}` (git blob sha of the upload) |
+   | `ol-date`      | `2026-11-23` (only when the note has no `date`, to pin it) |
 
-Tags on DEV are taken from the `dev-tags` value in the frontmatter. If the value
-is not an array, it will be ignored. Elements that are not strings will be
-removed. DEV supports at most 4 tags. If you specify more than 4 tags, only the
-first 4 will be used.
+Running the command again updates the same branch and pull request. If the
+pull request was closed or merged, a new one is opened from the same branch.
 
-DEV shows tags prefixed with a hash (`#`). Don't add this yourself. The actual tag is the
-text without the hash.
+On re-publish, files from a previous publish that are no longer part of the
+post (a removed image or `thumbnail.*`, or the old directory's files after a
+slug or category change) are deleted from the branch, **but only if the plugin
+can prove it owns them**: `ol-files` records the git blob sha GitHub returned
+for each upload, and a file is deleted only while the branch still holds
+exactly that blob. A file that was changed on the branch (e.g. a maintainer
+edited it after the pull request was merged), or whose recorded sha doesn't
+match (e.g. a hand-edited `ol-files`), is left alone. So are entries without a
+sha: the plain-path `ol-files` lists written by earlier versions of the plugin
+and `ol-path`. Files left alone are listed in a notice after publishing, so
+you can remove them in the pull request yourself. Only paths under
+`src/content/posts/` are ever considered.
 
-> [!NOTE]
-> Obsidian tags are not used, as they can be used for different purposes. E.g. I
-> use tags to indicate the purposes of notes, e.g. `project/article`, and I use
-> links for grouping by topics. But on DEV, tags would correspond to topics.
+When publishing from a fork whose base branch is behind the target, the plugin
+syncs the fork's base branch (GitHub's "Sync fork") so that new post branches
+always start at the target's current base commit. If the fork's base branch
+has diverged and can't be synced, publishing stops with an error; sync or reset
+the fork on GitHub and try again.
 
-### Images
+Publishing the same note again while a publish is still running is refused.
 
-It is not possible for the plugin to handle images completely. The DEV API does
-not expose the capability of uploading images. This means that you need to
-upload any images manually.
+## Setup
 
-If you later need to update the article, you can now create a mapping from
-embedded image links to the public URL where that resource is available.
+1. Install the plugin (copy `main.js` and `manifest.json` from a release into
+   `<vault>/.obsidian/plugins/publish-to-openlakehouse/`) and enable it.
+2. Create a GitHub token:
+   - **You have write access to the site repository:** create a
+     [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new)
+     with access to `open-lakehouse/openlakehouse-io` and the repository
+     permissions **Contents: Read and write** and **Pull requests: Read and
+     write**. Leave _Head repository_ empty.
+   - **You contribute from a fork:** fork `open-lakehouse/openlakehouse-io`
+     on GitHub and set _Head repository_ to `your-user/openlakehouse-io`.
+     GitHub does not let fine-grained tokens open pull requests on
+     repositories outside the token's resource owner, so in this case use a
+     [classic token](https://github.com/settings/tokens/new) with the
+     `public_repo` scope. (If _Head repository_ is empty and the token can't
+     push to the target, the plugin forks the repository for you, which also
+     needs a classic token.)
+3. Open the plugin settings and fill in:
 
-Use the "Map embedded images to public URLs" command.
+   | Setting              | Default                           | Description |
+   | -------------------- | --------------------------------- | ----------- |
+   | GitHub token         |                                   | Sent as `Authorization: Bearer <token>`. Stored in plain text! |
+   | Target repository    | `open-lakehouse/openlakehouse-io` | Repository the pull request is opened against. |
+   | Base branch          | `main`                            | Branch posts start from and merge into. |
+   | Head repository      | _(empty = auto)_                  | `owner/name` of the repository receiving the branch, e.g. your fork. |
+   | Default category     | _(empty)_                         | Category folder when a note has no `ol-category` (e.g. `iceberg`, `delta-lake`, `apache-spark`, `unity-catalog`, `agentic`). |
+   | Default author id(s) | _(empty)_                         | Comma separated ids of files in `src/content/authors/` (e.g. `scott-haines`). |
+   | Site URL             | `https://openlakehouse.io`        | Used for links between published notes. |
 
-Note: It is intended to integrate this to the workflow of updating a published
-article.
+Authors must exist in `src/content/authors/<id>.mdx` in the site repository;
+add yourself there (in the same or a separate pull request) if you're new.
 
-### Series
+## Note frontmatter
 
-If the article is part of a series, you write the series name in the
-`dev-series` metadata property.
+The generated post frontmatter follows the site's schema
+(`src/content/content.ts`). Each field is read from `ol-<key>` first, then from
+the plain `<key>`, so you can keep Obsidian's own use of e.g. `tags` separate
+by using `ol-tags`.
 
-TODO: Support this being a link to another note about the series itself, and
-read the name from that note, the title, or a metadata property.
+| Post field          | Note keys                                   | Default |
+| ------------------- | ------------------------------------------- | ------- |
+| `title`             | `ol-title`, `title`, else first H1, else file name | |
+| `subtitle`          | `ol-subtitle`, `subtitle`                   | omitted |
+| `date`              | `ol-date`, `date`                           | today (then pinned as `ol-date`) |
+| `authors`           | `ol-authors`, `authors`, `ol-author`, `author` | default author id(s) |
+| `excerpt`           | `ol-excerpt`, `excerpt`                     | first paragraph, ~160 characters |
+| `tags`              | `ol-tags`, `tags` (a leading `#` is removed) | `[]` |
+| `include`           | `ol-include`, `include` (`blog`, `learn`)   | `[blog]` |
+| `kind`              | `ol-kind`, `kind` (`post`, `getting-started`, `deep-dive`, `concept`, `tutorial`) | `post` |
+| `status`            | `ol-status`, `status` (`published`, `preview`, `draft`) | omitted (= published) |
+| `thumbnail`         | `ol-thumbnail`, `thumbnail`                 | omitted |
+| `readingTime`, `video`, `originalUrl`, `originalPublisher`, `externalUrl`, `flowDiagram` | `ol-<key>`, `<key>` | omitted |
 
-NOTE: At the time of writing this, I have not created a series on DEV, but I can
-see that the value is set when editing the series for my unpublished test
-articles.
+Where the post goes:
 
-### Mathjax support
+- **Category:** `ol-category`, else the category in `ol-path`, else the default
+  category.
+- **Slug:** `ol-slug` / `slug`, else the slug in `ol-path`, else the note's file
+  name, as kebab-case.
 
-Inline Mathjax, i.e. contained in single-`$`, like "This is our $CO_2$ report",
-will be converted to `{% katex inline %}` supported by DEV.
+**Thumbnail:** an `https://` URL is written to `thumbnail:` as is. A vault
+image (`thumbnail: "[[cover.png]]"`) is uploaded as `thumbnail.<ext>` next to
+`index.mdx`, where the site picks it up automatically.
 
-Mathjax blocks, i.e. wrapped in double-`$`s, will be converted to `{% katex %}`
-blocks.
+Every other frontmatter key (`aliases`, `cssclasses`, `publish`, the `ol-*`
+bookkeeping keys, …) is left out of the post.
 
-As this is probably a niche case, and could mess up texts that use
-`$`-characters, e.g. a finance report, you have to explicitly enable this by
-setting `dev-enable-mathjax` in the frontmatter.
+## Conversion
 
-### Example
+- **Title:** when the title comes from the first H1, that heading and anything
+  before it are removed from the body (the site renders the title itself).
+- **Images:** `![[image.png]]`, `![[image.png|alt text]]` and
+  `![alt](relative/image.png)` are uploaded next to `index.mdx` with a safe
+  lower-case file name, and rendered the way the site's posts do it:
 
-Given, `My portfolio.md` exists in the vault with the following contents
+  ```mdx
+  import img0 from "./image.png";
 
-```markdown
----
-url: https://example.com/my-portfolio
----
+  <img src={img0} alt="alt text" />
+  ```
 
-# My Portfolio
+  Remote images (`![](https://…)`) are left alone. Publishing fails if an
+  embedded image is not in the vault.
+- **Wikilinks:** `[[Other note]]` becomes a link to
+  `<site URL>/blog/<category>/<slug>` if the other note has been published
+  (it has `ol-path`), and plain text otherwise. Embeds of other notes are
+  treated the same way.
+- **Comments:** `%%Obsidian comments%%` and `<!-- HTML comments -->` are
+  removed.
+- **Callouts:** `> [!note] Title` becomes a plain blockquote starting with
+  `> **Title**` (or the callout type when there's no title).
+- **Autolinks:** `<https://example.com>` (not supported by MDX) becomes
+  `[https://example.com](https://example.com)`.
+- **Indented code blocks** (not supported by MDX) are converted to fenced code
+  blocks with their contents unchanged, also inside lists and blockquotes.
+- **MDX escaping:** `{`, `}` and `<` in prose are escaped (`\{`, `\}`,
+  `&lt;`), so a note that happens to contain them still compiles. The note is
+  parsed as CommonMark + GFM (like Obsidian renders it), and code (including
+  fences nested in lists and blockquotes), inline code, link and image
+  destinations, reference definitions and bare URLs are left untouched. This also means raw HTML/JSX
+  in a note is shown as text rather than rendered.
 
-...
+## Known limitations
+
+- Every file is its own commit (the Contents API writes one file per commit).
+  Squash-merging the pull request keeps `main` tidy.
+- If the post branch already exists, it is not rebased onto the latest base
+  branch.
+- Wikilinks to headings link to the post, not to the heading.
+- Other Obsidian-only syntax (highlights `==…==`, block references `^id`,
+  math) is passed through unchanged; the site does not render math.
+
+## Development
+
+```sh
+pnpm install        # or: npx pnpm install
+pnpm exec tsc -noEmit -skipLibCheck
+pnpm test           # mocha + tsx, includes compiling generated MDX with @mdx-js/mdx
+pnpm exec eslint .
+node esbuild.config.mjs production
 ```
 
-And, `My bio.md` doesn't exist in the vault, or it exists but doesn't have a
-`url` metadata field,
+`pnpm build` runs all of the above.
 
-When I publish the file:
+## Credits and license
 
-```markdown
----
-dev-tags:
-  - javascript
-  - tdd
----
+This plugin is a retargeted fork of
+[obsidian-dev-publish](https://github.com/stroiman/obsidian-dev-publish)
+("Publish to DEV") by **Peter Strøiman**, which publishes notes to
+[DEV](https://dev.to). The replace-instruction based markdown processing, the
+test fakes for the Obsidian API and the overall plugin structure come from that
+project. Thank you, Peter!
 
-related:
- - [[TDD MOC]]
- - [[Javascript MOC]]
-
-# How I write TDD in JS
-
-I am good at it.
-
-See my portfolio at [[My portfolio]], and my [[My bio]]
-```
-
-Then the following article is created on DEV.
-
-```json
-{
-  "tags": ["javascript", "tdd"],
-  "title: "How I write TDD in JS",
-  "markdown": "I am good at it\n\nSee my portfolio at [My
-  portfolio](https://example.com/my-portfolio), and My bio"
-}
-```
-
-### A note about the special meaning of H1
-
-Obsidian uses markdown as its file format, and markdown has a special affinity
-with HTML (after all, markdown is originally a tool that can generate HTML from
-human readable text files).
-
-According to the HTML standard, each page should have exactly **one** H1
-element that is the actual title of the page (despite the fact that there is
-also a `<title>` element on the page, but that is not shown ON the page, but
-typically in the browser's header - and a default value for bookmark names).
-
-When editing an article on DEV, their help text also says that the title of an
-article will be rendered as H1, and you should avoid using H1 elements in the
-body; that H2 should be the 'lowest' heading used in the body.
-
-It is note required that the H1 is the first text on the page. In accordance
-with that, I keep links to relevant notes during the writing at the very top of
-the note in obsidian; before the H1. Links to supporting observations,
-contradictory ideas, ideas I _may_ want to reflect on when writing this article.
-
-That is why everything up to, and including, the first H1 in a note is
-ignored, and why the heading text of the first H1 in the note is used as the
-title when creating a note on DEV.
-
-### Rendering of medialinks
-
-When the plugin encounters a medialink in the note, it will try to find the
-actual note that is being linked. If that note has a `url` property in the
-frontmatter, that value will be used as the link `href`.
-
-For example, the note you publish has the following:
-
-```markdown
-I need to explain more about [[Medialink|medialinks]].
-```
-
-And `Medialink.md` has the following contents:
-
-```
----
-url: http://example.com/medialink
----
-...
-```
-
-Then the generated markdown published will be:
-
-```markdown
-I need to explain more about [medialinks](http://example.com/medialink).
-```
-
-p.s. I have not tested how this works, if you have configured Obsidian to use
-markdown links instead of medialinks.
-
-> [!WARNING] 
-> This feature does not work for medialinks in a footnote due to a [bug in the
-> Obsidian API](https://github.com/obsidianmd/obsidian-api/issues/166).
-> "Fixed" in version 0.11.2 of this plugin
-
-## Desired features
-
-### Essential
-
-* Securely handle API keys through system keychain/secure storage (although some
-  research seems to indicate that this is not possible).
-* Better image handling. DEV doesn't support image upload through the API,
-  requiring you to upload them manually, and configure the mapping in the
-  frontmatter.
-  * One possibility is to upload to another site, or AWS S3 instead.
-* Control published state from Obsidian. Right now, new articles are created as
-  draft, allowing you to control everything before publishing.
-* Suggestion from @Rooyca: Autopublish - configurable by the user
-
-So unfortunately, one essential feature seems to be impossible, let me know if
-you happen to know how a way to securely handle secrets from Obsidian plugins.
-
-## Filing a bug report
-
-If creating a note doesn't work, first check, and double check that the
-access token is valid.
-
-If you wish to file a bug report, please copy the error message from the
-Obsidian console logs. (Accessible through the Developer Tools).
-
-It will be helpful if you can share the note that you wish to publish,
-as well as any linked notes.
-
-## Support this work
-
-You can support my work here:
-
-<a href="https://www.buymeacoffee.com/stroiman" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-orange.png" alt="Buy Me A Coffee" height="41" width="174"></a>
+Released under the MIT license, see [LICENSE](./LICENSE).

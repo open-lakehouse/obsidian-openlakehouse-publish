@@ -5,275 +5,542 @@ import {
   GenericVault,
   GetFrontMatterInfo,
 } from "./interfaces";
-import MediumGateway, { Article } from "./medium-gateway";
-import type { DialogController } from "./image-mapping-dialog";
-import { isArray, isObject, isString } from "./validation";
-
-const ARTICLE_ID_KEY = "dev-article-id";
-const ARTICLE_URL_KEY = "dev-url";
-const ARTICLE_CANONICAL_URL_KEY = "dev-canonical-url";
-const ARTICLE_IMAGE_MAP_KEY = "dev-image-map";
-const ARTICLE_PUBLISHED = "dev-published";
-const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".heif"];
+import type {
+  OwnedFile,
+  PublishFile,
+  PublishGateway,
+  PublishPostResult,
+} from "./gateway";
+import {
+  FrontmatterEntry,
+  Range,
+  ReplaceInstruction,
+  applyReplaceInstructions,
+  calloutInstructions,
+  commentInstructions,
+  deriveExcerpt,
+  escapeInstructions,
+  escapeMdxText,
+  safeFileName,
+  slugify,
+  toYamlFrontmatter,
+} from "./mdx";
+import { analyzeMarkdown, MarkdownImage } from "./markdown-ast";
 
 export type JsonObject = { [key: string]: Json };
 export type Json = string | number | boolean | null | Json[] | JsonObject;
 
-type ReplaceInstruction = { from: number; to: number; replaceString: string };
+/** Frontmatter keys written back to the note after publishing */
+export const OL_PATH_KEY = "ol-path";
+export const OL_BRANCH_KEY = "ol-branch";
+export const OL_PR_URL_KEY = "ol-pr-url";
+export const OL_PR_NUMBER_KEY = "ol-pr-number";
+export const OL_DATE_KEY = "ol-date";
+/**
+ * Every file uploaded by the last publish (index.mdx + images), as a list of
+ * `{path, sha}` where sha is the git blob sha GitHub returned for the upload.
+ * The sha is the proof of ownership: an obsolete file is only deleted while
+ * the branch still holds exactly that blob.
+ */
+export const OL_FILES_KEY = "ol-files";
 
-export const replaceInstructionsEqual = (
-  a: ReplaceInstruction,
-  b: ReplaceInstruction,
-) => a.from === b.from && a.to === b.to && a.replaceString === b.replaceString;
+export const IMAGE_EXTENSIONS = [
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "avif",
+  "svg",
+];
 
-const isImageMap = (input: unknown) =>
-  isObject(input, {
-    publicUrl: isString,
-    imageFile: isString,
-  });
-const isMapping = (input: unknown) => isArray(input, isImageMap);
+const VALID_INCLUDE = ["blog", "learn"];
+const VALID_STATUS = ["published", "preview", "draft"];
+const VALID_KIND = ["post", "getting-started", "deep-dive", "concept", "tutorial"];
 
-const removeDuplicateReplaceInstructions = (
-  instructions: ReplaceInstruction[],
-) => {
-  return instructions.filter(
-    (value, index) =>
-      index ===
-      instructions.findIndex((search) =>
-        replaceInstructionsEqual(value, search),
-      ),
-  );
+/** Optional site keys that are passed through verbatim (see content.ts) */
+const PASSTHROUGH_STRING_KEYS = [
+  "video",
+  "originalUrl",
+  "originalPublisher",
+  "externalUrl",
+  "flowDiagram",
+];
+
+export type PublisherConfig = {
+  /** Category used when the note has no `ol-category` */
+  defaultCategory: string;
+  /** Author ids (files in src/content/authors) used when the note has none */
+  defaultAuthors: string[];
+  /** Base URL of the site, for links between published notes */
+  siteUrl: string;
+  /** Directory holding the posts in the target repository */
+  postsRoot: string;
+  /** Injected for tests */
+  today?: () => string;
 };
 
-const processInlineMathJax = (jax: string): ReplaceInstruction[] => {
-  const matches = [...jax.matchAll(/(\${1})([^\n$]+)\1/g)];
-  return matches
-    .map((match): ReplaceInstruction | undefined => {
-      const matchJax = match[2];
-      if (typeof match.index !== "number") {
-        return undefined;
-      }
-      return {
-        from: match.index,
-        to: match.index + match[0].length,
-        replaceString: `{% katex inline %}\n ${matchJax}\n{% endkatex %}`,
-      };
-    })
-    .filter((x) => typeof x !== "undefined");
+export const DEFAULT_PUBLISHER_CONFIG: PublisherConfig = {
+  defaultCategory: "",
+  defaultAuthors: [],
+  siteUrl: "https://openlakehouse.io",
+  postsRoot: "src/content/posts",
 };
 
-const processBlockMathJax = (jax: string): ReplaceInstruction[] => {
-  const matches = [...jax.matchAll(/(\${2})([^$]+)\1/g)];
-  return matches
-    .map((match): ReplaceInstruction | undefined => {
-      const matchJax = match[2];
-      if (typeof match.index !== "number") {
-        return undefined;
-      }
-      return {
-        from: match.index,
-        to: match.index + match[0].length,
-        replaceString: `{% katex %}\n${matchJax.trim()}\n{% endkatex %}`,
-      };
-    })
-    .filter((x) => typeof x !== "undefined");
+export type PostAsset<TFile> = { fileName: string; file: TFile };
+
+export type GeneratedPost<TFile> = {
+  category: string;
+  slug: string;
+  title: string;
+  /** Path of the post directory, relative to the repository root */
+  directory: string;
+  /** Complete index.mdx file contents */
+  mdx: string;
+  /** Images to co-locate with index.mdx */
+  assets: PostAsset<TFile>[];
+  date: string;
+};
+
+const isString = (x: unknown): x is string => typeof x === "string";
+
+const asStringList = (value: Json | undefined): string[] | undefined => {
+  if (Array.isArray(value)) {
+    return value.filter(isString).map((x) => x.trim()).filter(Boolean);
+  }
+  if (isString(value) && value.trim()) {
+    return value
+      .split(/[,\s]+/)
+      .map((x) => x.trim())
+      .filter(Boolean);
+  }
+  return undefined;
+};
+
+const extensionOf = (path: string) => {
+  const name = path.split("/").pop() || "";
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.substring(dot + 1).toLowerCase() : "";
+};
+
+const basenameOf = (path: string) => {
+  const name = path.split("/").pop() || path;
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.substring(0, dot) : name;
+};
+
+const isImagePath = (path: string) => IMAGE_EXTENSIONS.includes(extensionOf(path));
+
+const isRemote = (link: string) => /^[a-z][a-z0-9+.-]*:/i.test(link);
+
+/** Strips `#heading` / `^block` subpaths from a link */
+const linkPath = (link: string) => link.replace(/[#^].*$/, "");
+
+const toIsoDate = (value: Json | undefined): string | undefined => {
+  if (!isString(value) && typeof value !== "number") {
+    return undefined;
+  }
+  const s = String(value).trim();
+  const match = /^(\d{4}-\d{2}-\d{2})/.exec(s);
+  if (match) {
+    return match[1];
+  }
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? undefined : d.toISOString().substring(0, 10);
+};
+
+const jsxString = (s: string) =>
+  /["{}<>\n]/.test(s) ? `{${JSON.stringify(s)}}` : `"${s}"`;
+
+export class PublishError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PublishError";
+  }
+}
+
+/** Parse the post category and slug back out of an `ol-path` value */
+export const parseOlPath = (path: Json | undefined) => {
+  if (!isString(path)) {
+    return undefined;
+  }
+  const match = /posts\/([^/]+)\/([^/]+)\/index\.mdx$/.exec(path);
+  return match ? { category: match[1], slug: match[2] } : undefined;
 };
 
 export default class Publisher<TFile extends { path: string }> {
   app: GenericApp<TFile>;
   fileManager: GenericFileManager<TFile>;
-  gateway: MediumGateway;
+  gateway: PublishGateway;
   getFrontMatterInfo: GetFrontMatterInfo;
   vault: GenericVault<TFile>;
+  config: PublisherConfig;
 
   constructor(
     app: GenericApp<TFile>,
-    gateway: MediumGateway,
+    gateway: PublishGateway,
     getFrontMatterInfo: GetFrontMatterInfo,
+    config: Partial<PublisherConfig> = {},
   ) {
     this.app = app;
     this.fileManager = app.fileManager;
     this.gateway = gateway;
     this.vault = app.vault;
     this.getFrontMatterInfo = getFrontMatterInfo;
+    this.config = { ...DEFAULT_PUBLISHER_CONFIG, ...config };
   }
 
   getFrontMatter(file: TFile) {
     return this.app.metadataCache.getFileCache(file)?.frontmatter;
   }
 
-  applyReplaceInstruction(
-    replaceInstructions: ReplaceInstruction[],
-    contents: string,
-  ) {
-    const flattened = replaceInstructions.filter(
-      (x) => !replaceInstructions.find((y) => x.from > y.from && x.to < y.to),
-    );
-    flattened.sort((a, b) => a.from - b.from);
-    // console.log("Replace instructions", flattened);
-
-    const result = flattened.reduce(
-      (prev, curr) => {
-        const toKeep = contents.substring(prev.lastIndex, curr.from);
-        return {
-          result: [...prev.result, toKeep, curr.replaceString],
-          lastIndex: curr.to,
-        };
-      },
-      { result: [], lastIndex: 0 },
-    );
-    const finalResult = [
-      ...result.result,
-      contents.substring(result.lastIndex),
-    ].join("");
-    return finalResult;
+  /** Reads `ol-<key>`, falling back to the plain `<key>` */
+  private fmValue(frontmatter: JsonObject, key: string): Json | undefined {
+    const ol = frontmatter[`ol-${key}`];
+    return ol !== undefined && ol !== null && ol !== ""
+      ? ol
+      : frontmatter[key] ?? undefined;
   }
 
-  async processLinks(
+  private resolveFile(link: string, file: TFile) {
+    return this.app.metadataCache.getFirstLinkpathDest(
+      linkPath(link),
+      file.path,
+    );
+  }
+
+  private siteUrlFor(target: TFile): string | undefined {
+    const parsed = parseOlPath(this.getFrontMatter(target)?.[OL_PATH_KEY]);
+    if (!parsed) {
+      return undefined;
+    }
+    const base = this.config.siteUrl.replace(/\/$/, "");
+    return `${base}/blog/${parsed.category}/${parsed.slug}`;
+  }
+
+  processLinks(
     file: TFile,
     cachedMetadata: CachedMetadata | null,
-  ): Promise<ReplaceInstruction[]> {
-    const links = cachedMetadata?.links;
-    if (!links) {
-      return [];
-    }
-    const replaceInstructions = links
-      .map((link) => {
-        const targetFile = this.app.metadataCache.getFirstLinkpathDest(
-          link.link,
-          file.path,
-        );
-        const frontmatter = targetFile && this.getFrontMatter(targetFile);
-        const url = frontmatter?.url;
-        const displayText = link.displayText || link.link;
-        const replaceString = url ? `[${displayText}](${url})` : displayText;
-        return [
-          {
-            from: link.position.start.offset,
-            to: link.position.end.offset,
-            replaceString,
-          },
-        ];
-      })
-      .flat();
-    // Remove duplicates - necessary until this is fixed:
-    // https://github.com/obsidianmd/obsidian-api/issues/166
-    return removeDuplicateReplaceInstructions(replaceInstructions);
-  }
-
-  processImages(_file: TFile, md: CachedMetadata | null): ReplaceInstruction[] {
-    if (!md?.embeds) {
-      return [];
-    }
-    const frontmatter = md.frontmatter;
-    const imageMap = frontmatter && frontmatter[ARTICLE_IMAGE_MAP_KEY];
-    const getExistingMap = (file: string) => {
-      return (
-        isMapping(imageMap) &&
-        imageMap.find((x) => x.imageFile === `[[${file}]]`)?.publicUrl
-      );
-    };
-
-    return md.embeds.flatMap((embed): ReplaceInstruction[] => {
-      const publicUrl = getExistingMap(embed.link);
-      const displayText = embed.displayText || embed.link;
-      const { start, end } = embed.position;
-      return publicUrl
-        ? [
-            {
-              replaceString: `![${displayText}](${publicUrl})`,
-              from: start.offset,
-              to: end.offset,
-            },
-          ]
-        : [];
+  ): ReplaceInstruction[] {
+    const links = cachedMetadata?.links || [];
+    return links.map((link) => {
+      const targetFile = this.resolveFile(link.link, file);
+      const url = targetFile && this.siteUrlFor(targetFile);
+      const displayText = escapeMdxText(link.displayText || link.link);
+      return {
+        from: link.position.start.offset,
+        to: link.position.end.offset,
+        replaceString: url ? `[${displayText}](${url})` : displayText,
+      };
     });
   }
 
-  async generateMarkdown(file: TFile) {
-    const originalContents = await this.vault.read(file);
-    const metadataCache = this.app.metadataCache.getFileCache(file);
-    const frontmatter = metadataCache?.frontmatter || {};
-    const markdownLinkReplaceInstructions = await this.processLinks(
-      file,
-      metadataCache,
-    );
-    const imageEmbedsReplaceInstructions = this.processImages(
-      file,
-      metadataCache,
-    );
-    const h1 = metadataCache?.headings?.find((x) => x.level === 1);
-    const h1Instructions = h1
-      ? [
-          {
-            from: 0,
-            to: h1.position.end.offset,
-            replaceString: "",
-          },
-        ]
-      : [];
-
-    if (frontmatter["dev-enable-mathjax"]) {
-      markdownLinkReplaceInstructions.splice(
-        markdownLinkReplaceInstructions.length,
-        0,
-        ...processInlineMathJax(originalContents),
-      );
-      markdownLinkReplaceInstructions.splice(
-        markdownLinkReplaceInstructions.length,
-        0,
-        ...processBlockMathJax(originalContents),
-      );
+  /**
+   * Builds replace instructions for embedded images (both `![[img.png]]` and
+   * `![alt](local.png)`), and collects the images to upload alongside the
+   * post. Images are imported at the top of the MDX file and rendered with
+   * `<img src={imgN} />`, the convention used by the site.
+   */
+  processImages(
+    file: TFile,
+    md: CachedMetadata | null,
+    markdownImages: MarkdownImage[],
+    reservedNames: Set<string>,
+  ) {
+    type Embed = { from: number; to: number; link: string; alt?: string };
+    const embeds: Embed[] = (md?.embeds || []).map((e) => ({
+      from: e.position.start.offset,
+      to: e.position.end.offset,
+      link: e.link,
+      alt: e.displayText,
+    }));
+    for (const image of markdownImages) {
+      if (embeds.some((e) => e.from === image.from) || isRemote(image.url)) {
+        continue;
+      }
+      let link = image.url;
+      try {
+        link = decodeURI(image.url);
+      } catch {
+        // keep as written
+      }
+      embeds.push({ from: image.from, to: image.to, link, alt: image.alt });
     }
 
-    const dataAfterHeading = this.applyReplaceInstruction(
-      [
-        h1Instructions,
-        markdownLinkReplaceInstructions,
-        imageEmbedsReplaceInstructions,
-      ].flat(),
-      originalContents,
-    );
-    const frontmatterInfo =
-      this.getFrontMatterInfo.getFrontMatterInfo(dataAfterHeading);
-    const markdown = (
-      frontmatterInfo.exists
-        ? dataAfterHeading.substring(frontmatterInfo.contentStart)
-        : dataAfterHeading
-    ).trim();
-    return markdown;
+    const instructions: ReplaceInstruction[] = [];
+    const assets: (PostAsset<TFile> & { variable: string })[] = [];
+    for (const embed of embeds) {
+      const target = this.resolveFile(embed.link, file);
+      if (!isImagePath(embed.link) && !(target && isImagePath(target.path))) {
+        // Non-image embed (e.g. a note transclusion): treat it like a link
+        const url = target && this.siteUrlFor(target);
+        const text = escapeMdxText(embed.alt || linkPath(embed.link));
+        instructions.push({
+          from: embed.from,
+          to: embed.to,
+          replaceString: url ? `[${text}](${url})` : text,
+        });
+        continue;
+      }
+      if (!target) {
+        throw new PublishError(`Embedded image not found in vault: ${embed.link}`);
+      }
+      let asset = assets.find((a) => a.file.path === target.path);
+      if (!asset) {
+        asset = {
+          file: target,
+          fileName: this.uniqueName(safeFileName(target.path), reservedNames),
+          variable: `img${assets.length}`,
+        };
+        assets.push(asset);
+      }
+      const alt =
+        embed.alt &&
+        embed.alt !== embed.link &&
+        !/^\d+(x\d+)?$/.test(embed.alt.trim())
+          ? embed.alt.trim()
+          : basenameOf(target.path);
+      instructions.push({
+        from: embed.from,
+        to: embed.to,
+        replaceString: `<img src={${asset.variable}} alt=${jsxString(alt)} />`,
+      });
+    }
+    return { instructions, assets };
+  }
+
+  private uniqueName(name: string, reserved: Set<string>) {
+    let candidate = name;
+    // A co-located thumbnail.* is picked up as the post thumbnail by the site
+    if (/^thumbnail\./.test(candidate)) {
+      candidate = `image-${candidate}`;
+    }
+    const dot = candidate.lastIndexOf(".");
+    const stem = dot > 0 ? candidate.substring(0, dot) : candidate;
+    const ext = dot > 0 ? candidate.substring(dot) : "";
+    for (let i = 2; reserved.has(candidate) || candidate === "index.mdx"; i++) {
+      candidate = `${stem}-${i}${ext}`;
+    }
+    reserved.add(candidate);
+    return candidate;
   }
 
   generateTitle(file: TFile) {
-    const metadataCache = this.app.metadataCache.getFileCache(file);
-    const h1 = metadataCache?.headings?.find((x) => x.level === 1);
-    return h1?.heading || "Heading Missing";
+    const metadata = this.app.metadataCache.getFileCache(file);
+    const fm = metadata?.frontmatter || {};
+    const fmTitle = this.fmValue(fm, "title");
+    const h1 = metadata?.headings?.find((x) => x.level === 1);
+    if (isString(fmTitle) && fmTitle.trim()) {
+      return {
+        title: fmTitle.trim(),
+        h1: h1 && h1.heading.trim() === fmTitle.trim() ? h1 : undefined,
+      };
+    }
+    if (h1) {
+      return { title: h1.heading.trim(), h1 };
+    }
+    return { title: basenameOf(file.path), h1: undefined };
   }
 
-  async getArticleData(file: TFile): Promise<Article> {
-    const parseTags = (tags: Json | undefined) => {
-      if (!Array.isArray(tags)) {
-        return undefined;
+  /** Transforms the note body into MDX (without frontmatter) */
+  async generateMarkdown(file: TFile) {
+    const { body } = await this.generateBody(file, new Set());
+    return body;
+  }
+
+  private async generateBody(file: TFile, reservedNames: Set<string>) {
+    const text = await this.vault.read(file);
+    const metadata = this.app.metadataCache.getFileCache(file);
+    const fmInfo = this.getFrontMatterInfo.getFrontMatterInfo(text);
+    const bodyStart = fmInfo.exists ? fmInfo.contentStart : 0;
+    const analysis = analyzeMarkdown(text, bodyStart);
+    const { codeRanges } = analysis;
+
+    const { h1 } = this.generateTitle(file);
+    const structural: ReplaceInstruction[] = [
+      // The site renders the title from frontmatter. As upstream, anything
+      // before the title heading is considered preamble and dropped.
+      { from: 0, to: h1 ? h1.position.end.offset : bodyStart, replaceString: "" },
+    ];
+    const { instructions: imageInstructions, assets } = this.processImages(
+      file,
+      metadata,
+      analysis.images,
+      reservedNames,
+    );
+    const instructions = [
+      ...structural,
+      ...commentInstructions(text, bodyStart, codeRanges),
+      ...this.processLinks(file, metadata),
+      ...imageInstructions,
+      ...calloutInstructions(text, bodyStart, codeRanges),
+      // indented code -> fenced code, <autolinks> -> [links](…)
+      ...analysis.instructions,
+    ];
+    const protectedRanges: Range[] = [
+      ...analysis.protectedRanges,
+      ...instructions,
+    ];
+    instructions.push(...escapeInstructions(text, bodyStart, protectedRanges));
+
+    const body = applyReplaceInstructions(instructions, text)
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    return { body, assets };
+  }
+
+  private resolveThumbnail(
+    file: TFile,
+    fm: JsonObject,
+  ): { url?: string; asset?: TFile } {
+    const value = this.fmValue(fm, "thumbnail");
+    if (!isString(value) || !value.trim()) {
+      return {};
+    }
+    const v = value.trim();
+    if (/^https?:\/\//i.test(v)) {
+      return { url: v };
+    }
+    const link = v.replace(/^!?\[\[|\]\]$/g, "").replace(/\|.*$/, "");
+    const target = this.resolveFile(link, file);
+    if (!target || !isImagePath(target.path)) {
+      throw new PublishError(`Thumbnail image not found in vault: ${v}`);
+    }
+    return { asset: target };
+  }
+
+  async generatePost(file: TFile): Promise<GeneratedPost<TFile>> {
+    const fm = this.getFrontMatter(file) || {};
+    const fromPath = parseOlPath(fm[OL_PATH_KEY]);
+
+    const slugValue = this.fmValue(fm, "slug");
+    const slug = slugify(
+      isString(slugValue) && slugValue.trim()
+        ? slugValue
+        : fromPath?.slug || basenameOf(file.path),
+    );
+    const categoryValue = fm["ol-category"];
+    const category = slugify(
+      isString(categoryValue) && categoryValue.trim()
+        ? categoryValue
+        : fromPath?.category || this.config.defaultCategory,
+    );
+    if (!slug) {
+      throw new PublishError("Could not derive a slug for the post");
+    }
+    if (!category) {
+      throw new PublishError(
+        "No category: set `ol-category` in the note or a default category in the plugin settings",
+      );
+    }
+
+    const { title } = this.generateTitle(file);
+    const reservedNames = new Set<string>(["index.mdx"]);
+    const thumbnail = this.resolveThumbnail(file, fm);
+    const assets: PostAsset<TFile>[] = [];
+    if (thumbnail.asset) {
+      const ext = extensionOf(thumbnail.asset.path);
+      const name = `thumbnail.${ext}`;
+      reservedNames.add(name);
+      assets.push({ fileName: name, file: thumbnail.asset });
+    }
+    const { body, assets: bodyAssets } = await this.generateBody(
+      file,
+      reservedNames,
+    );
+
+    const authors =
+      asStringList(this.fmValue(fm, "authors")) ||
+      asStringList(this.fmValue(fm, "author")) ||
+      this.config.defaultAuthors;
+    if (!authors.length) {
+      throw new PublishError(
+        "No authors: set `ol-authors` in the note or default author ids in the plugin settings",
+      );
+    }
+    const date =
+      toIsoDate(this.fmValue(fm, "date")) ||
+      (this.config.today
+        ? this.config.today()
+        : new Date().toISOString().substring(0, 10));
+
+    const entries: FrontmatterEntry[] = [["title", title]];
+    const subtitle = this.fmValue(fm, "subtitle");
+    if (isString(subtitle) && subtitle.trim()) {
+      entries.push(["subtitle", subtitle.trim()]);
+    }
+    entries.push(["date", date], ["authors", authors]);
+    const excerptValue = this.fmValue(fm, "excerpt");
+    const excerpt =
+      isString(excerptValue) && excerptValue.trim()
+        ? excerptValue.trim()
+        : deriveExcerpt(body);
+    if (excerpt) {
+      entries.push(["excerpt", excerpt]);
+    }
+    const tags = (asStringList(this.fmValue(fm, "tags")) || []).map((t) =>
+      t.replace(/^#/, ""),
+    );
+    entries.push(["tags", tags]);
+
+    const include = asStringList(this.fmValue(fm, "include")) || ["blog"];
+    const badInclude = include.filter((x) => !VALID_INCLUDE.includes(x));
+    if (badInclude.length) {
+      throw new PublishError(`Invalid include value(s): ${badInclude.join(", ")}`);
+    }
+    entries.push(["include", include]);
+
+    const kind = this.fmValue(fm, "kind");
+    const kindValue = isString(kind) && kind.trim() ? kind.trim() : "post";
+    if (!VALID_KIND.includes(kindValue)) {
+      throw new PublishError(`Invalid kind: ${kindValue}`);
+    }
+    entries.push(["kind", kindValue]);
+
+    const status = this.fmValue(fm, "status");
+    if (isString(status) && status.trim()) {
+      if (!VALID_STATUS.includes(status.trim())) {
+        throw new PublishError(`Invalid status: ${status}`);
       }
-      return tags.filter((x) => typeof x === "string").slice(0, 4);
-    };
-    const parseString = (value: Json | undefined) => {
-      if (typeof value === "string") {
-        return value;
+      entries.push(["status", status.trim()]);
+    }
+    if (thumbnail.url) {
+      entries.push(["thumbnail", thumbnail.url]);
+    }
+    const readingTime = this.fmValue(fm, "readingTime");
+    if (typeof readingTime === "number") {
+      entries.push(["readingTime", readingTime]);
+    }
+    for (const key of PASSTHROUGH_STRING_KEYS) {
+      const value = this.fmValue(fm, key);
+      if (isString(value) && value.trim()) {
+        entries.push([key, value.trim()]);
       }
-      return undefined;
-    };
-    const metadataCache = this.app.metadataCache.getFileCache(file);
-    const markdown = await this.generateMarkdown(file);
-    const title = this.generateTitle(file);
-    const tags = parseTags(metadataCache?.frontmatter?.["dev-tags"]);
-    const series = parseString(metadataCache?.frontmatter?.["dev-series"]);
+    }
+
+    const imports = bodyAssets.map(
+      (a) => `import ${a.variable} from "./${a.fileName}";`,
+    );
+    const mdx = [
+      toYamlFrontmatter(entries),
+      ...(imports.length ? [imports.join("\n")] : []),
+      body,
+    ]
+      .filter((x) => x !== "")
+      .join("\n\n")
+      .concat("\n");
 
     return {
+      category,
+      slug,
       title,
-      markdown,
-      tags,
-      series,
+      date,
+      directory: `${this.config.postsRoot.replace(/\/$/, "")}/${category}/${slug}`,
+      mdx,
+      assets: [
+        ...assets,
+        ...bodyAssets.map(({ fileName, file }) => ({ fileName, file })),
+      ],
     };
   }
 
@@ -285,77 +552,100 @@ export default class Publisher<TFile extends { path: string }> {
     });
   }
 
-  async publish(file: TFile) {
-    const frontmatter = this.getFrontMatter(file);
-    const mediumId = frontmatter && frontmatter[ARTICLE_ID_KEY];
-    const article = await this.getArticleData(file);
-    if (typeof mediumId === "number") {
-      await this.updateStatus(file);
-      await this.gateway.updateArticle({ id: mediumId, article });
-    } else {
-      const result = await this.gateway.createArticle({ article });
-      const newFrontmatter = {
-        [ARTICLE_ID_KEY]: result.id,
-        [ARTICLE_URL_KEY]: result.url,
-        [ARTICLE_CANONICAL_URL_KEY]: result.canonicalUrl,
-      };
-      this.updateFrontmatter(file, newFrontmatter);
+  /**
+   * Files from a previous run (recorded in `ol-files`, plus the legacy
+   * `ol-path` index.mdx) that are not part of the post any more, e.g. a
+   * removed image or thumbnail, or the old location after a slug/category
+   * change. Only paths inside the posts directory are considered.
+   *
+   * - `owned`: entries recorded with the blob sha of the upload; they may be
+   *   deleted, if the branch still holds that exact blob.
+   * - `unowned`: legacy entries (plain strings, `ol-path` alone) without
+   *   provenance; these are never deleted automatically.
+   */
+  obsoleteFiles(fm: JsonObject, currentPaths: string[]) {
+    const root = `${this.config.postsRoot.replace(/\/$/, "")}/`;
+    const current = new Set(currentPaths);
+    const inScope = (path: unknown): path is string =>
+      isString(path) &&
+      path.startsWith(root) &&
+      !path.split("/").some((seg) => seg === ".." || seg === "." || seg === "") &&
+      !current.has(path);
+
+    const owned: OwnedFile[] = [];
+    const unowned: string[] = [];
+    const seen = new Set<string>();
+    const recorded = Array.isArray(fm[OL_FILES_KEY]) ? (fm[OL_FILES_KEY] as Json[]) : [];
+    for (const entry of [...recorded, fm[OL_PATH_KEY]]) {
+      const isEntry =
+        entry !== null && typeof entry === "object" && !Array.isArray(entry);
+      const path = isEntry ? (entry as JsonObject).path : entry;
+      const sha = isEntry ? (entry as JsonObject).sha : undefined;
+      if (!inScope(path) || seen.has(path)) {
+        continue;
+      }
+      seen.add(path);
+      if (isString(sha) && /^[0-9a-f]{40,64}$/i.test(sha)) {
+        owned.push({ path, sha });
+      } else {
+        unowned.push(path);
+      }
     }
+    return { owned, unowned };
   }
 
-  async updateStatus(file: TFile) {
-    // Get status from DEV, and update URLs
-    const frontmatter = this.getFrontMatter(file);
-    const id: any = frontmatter && frontmatter[ARTICLE_ID_KEY];
-    if (typeof id === "number") {
-      const status = await this.gateway.getArticleStatus({ id });
-      await this.fileManager.processFrontMatter(file, (fm) => {
-        fm[ARTICLE_PUBLISHED] = status.published;
-        if (status.published) {
-          fm[ARTICLE_URL_KEY] = status.url;
-          fm[ARTICLE_CANONICAL_URL_KEY] = status.canonicalUrl;
-        }
+  async publish(file: TFile): Promise<PublishPostResult> {
+    const fm = this.getFrontMatter(file) || {};
+    const post = await this.generatePost(file);
+    const files: PublishFile[] = [
+      { path: `${post.directory}/index.mdx`, content: post.mdx },
+    ];
+    for (const asset of post.assets) {
+      files.push({
+        path: `${post.directory}/${asset.fileName}`,
+        content: await this.vault.readBinary(asset.file),
       });
     }
-  }
-
-  async mapImages(file: TFile, dialogController: DialogController) {
-    const md = this.app.metadataCache.getFileCache(file);
-    if (!md) {
-      return;
-    }
-    const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
-    const imageMap = frontmatter && frontmatter[ARTICLE_IMAGE_MAP_KEY];
-    const getExistingMap = (file: string) => {
-      return (
-        isMapping(imageMap) &&
-        imageMap.find((x) => x.imageFile === `[[${file}]]`)?.publicUrl
-      );
+    const currentPaths = files.map((f) => f.path);
+    const obsolete = this.obsoleteFiles(fm, currentPaths);
+    const previousBranch = fm[OL_BRANCH_KEY];
+    const previousPr = fm[OL_PR_NUMBER_KEY];
+    const result = await this.gateway.publishPost({
+      branch:
+        isString(previousBranch) && previousBranch.trim()
+          ? previousBranch.trim()
+          : `obsidian/${post.slug}`,
+      files,
+      deleteFiles: obsolete.owned,
+      title: post.title,
+      pullRequestBody: [
+        `Adds/updates the post **${post.title}** at \`${post.directory}/index.mdx\`.`,
+        "",
+        `Published from Obsidian with the *Publish to OpenLakehouse* plugin.`,
+      ].join("\n"),
+      previousPullRequestNumber:
+        typeof previousPr === "number" ? previousPr : undefined,
+    });
+    const update: JsonObject = {
+      [OL_PATH_KEY]: `${post.directory}/index.mdx`,
+      [OL_BRANCH_KEY]: result.branch,
+      [OL_PR_URL_KEY]: result.pullRequestUrl,
+      [OL_PR_NUMBER_KEY]: result.pullRequestNumber,
+      [OL_FILES_KEY]: currentPaths.map((path) =>
+        result.fileShas[path]
+          ? { path, sha: result.fileShas[path] }
+          : path,
+      ),
     };
-
-    const getExtension = (link: string) => {
-      const index = link.lastIndexOf(".");
-      return index === -1 ? "" : link.substring(index);
-    };
-    const list =
-      md.embeds
-        ?.map((x) => ({
-          imageFile: x.link,
-          publicUrl: getExistingMap(x.link) || "",
-        }))
-        .filter(({ imageFile }) =>
-          IMAGE_EXTENSIONS.includes(getExtension(imageFile)),
-        ) || [];
-
-    const result = await dialogController.showImageMappingDialog(list);
-    if (result) {
-      await this.app.fileManager.processFrontMatter(file, (fm) => {
-        fm[ARTICLE_IMAGE_MAP_KEY] =
-          result &&
-          result
-            .map((x) => ({ ...x, imageFile: `[[${x.imageFile}]]` }))
-            .filter((x) => x.publicUrl);
-      });
+    if (!toIsoDate(this.fmValue(fm, "date"))) {
+      // Pin the date so re-publishing doesn't move the post
+      update[OL_DATE_KEY] = post.date;
     }
+    await this.updateFrontmatter(file, update);
+    return {
+      ...result,
+      // Surface everything that was obsolete but left alone
+      deletesSkipped: [...result.deletesSkipped, ...obsolete.unowned],
+    };
   }
 }
