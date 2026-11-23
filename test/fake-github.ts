@@ -10,7 +10,10 @@ type FakeRepo = {
   owner: string;
   name: string;
   push: boolean;
+  defaultBranch?: string;
   fork?: { parent: string };
+  /** Branches that have diverged from upstream: merge-upstream returns 409 */
+  diverged?: string[];
   /** branch -> commit sha */
   branches: Record<string, string>;
   /** branch -> path -> { sha, content (base64) } */
@@ -151,11 +154,19 @@ export class FakeGitHub {
     if ((m = path.match(/^\/repos\/([^/]+)\/([^/]+)\/forks$/)) && method === "POST") {
       const parent = this.repo(`${m[1]}/${m[2]}`);
       if (!parent) return this.respond(404, { message: "Not Found" });
+      const onlyDefault = body?.default_branch_only === true;
+      const def = parent.defaultBranch || "main";
+      const copyBranches = onlyDefault
+        ? { [def]: parent.branches[def] }
+        : { ...parent.branches };
+      const copyFiles = JSON.parse(
+        JSON.stringify(onlyDefault ? { [def]: parent.files[def] } : parent.files),
+      );
       const fork = this.addRepo(`${this.login}/${parent.name}`, {
         push: true,
         fork: { parent: `${parent.owner}/${parent.name}` },
-        branches: { ...parent.branches },
-        files: JSON.parse(JSON.stringify(parent.files)),
+        branches: copyBranches,
+        files: copyFiles,
       });
       this.forkLookups = 0;
       return this.respond(202, {
@@ -177,6 +188,22 @@ export class FakeGitHub {
         ref: `refs/heads/${branch}`,
         object: { sha, type: "commit" },
       });
+    }
+
+    if ((m = path.match(/^\/repos\/([^/]+)\/([^/]+)\/merge-upstream$/)) && method === "POST") {
+      const repo = this.repo(`${m[1]}/${m[2]}`);
+      if (!repo?.fork) return this.respond(404, { message: "Not Found" });
+      const parent = this.repo(repo.fork.parent);
+      const branch = body?.branch;
+      if (!repo.branches[branch] || !parent.branches[branch]) {
+        return this.respond(422, { message: "Branch not found" });
+      }
+      if (repo.diverged?.includes(branch)) {
+        return this.respond(409, { message: "There are merge conflicts" });
+      }
+      repo.branches[branch] = parent.branches[branch];
+      repo.files[branch] = JSON.parse(JSON.stringify(parent.files[branch] || {}));
+      return this.respond(200, { merge_type: "fast-forward", base_branch: `${parent.owner}:${branch}` });
     }
 
     if ((m = path.match(/^\/repos\/([^/]+)\/([^/]+)\/git\/refs$/)) && method === "POST") {

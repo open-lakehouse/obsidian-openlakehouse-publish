@@ -226,25 +226,77 @@ describe("GitHubGateway", () => {
       expect(github.requestsMatching("GET", /^\/repos\/[^/]+\/[^/]+$/)).to.be.empty;
     });
 
-    it("falls back to the fork's base branch when the upstream commit is unknown to the fork", async () => {
+    it("syncs a stale fork (merge-upstream) and branches from the exact upstream base commit", async () => {
       const fork = github.addRepo("me/openlakehouse-io", { fork: { parent: TARGET } });
-      const forkMainSha = fork.branches.main;
+      const staleSha = fork.branches.main;
+      const upstreamSha = github.repo(TARGET).branches.main;
+      expect(staleSha).to.not.equal(upstreamSha);
       await gateway({ headRepo: parseRepo("me/openlakehouse-io") }).publishPost(input());
+
+      const sync = github.requestsMatching("POST", "/repos/me/openlakehouse-io/merge-upstream");
+      expect(sync).to.have.length(1);
+      expect(sync[0].body).to.deep.equal({ branch: "main" });
       const refs = github.requestsMatching("POST", "/repos/me/openlakehouse-io/git/refs");
-      expect(refs.map((r) => r.body.sha)).to.deep.equal([
-        github.repo(TARGET).branches.main,
-        forkMainSha,
-      ]);
+      // Both attempts use the upstream sha; the fork's stale sha is never used
+      expect(refs.map((r) => r.body.sha)).to.deep.equal([upstreamSha, upstreamSha]);
       expect(fork.files["obsidian/my-post"][`${POST_DIR}/index.mdx`]).to.exist;
+    });
+
+    it("fails clearly, without creating a branch, when the fork can't be synced", async () => {
+      const fork = github.addRepo("me/openlakehouse-io", {
+        fork: { parent: TARGET },
+        diverged: ["main"],
+      });
+      const error = await gateway({ headRepo: parseRepo("me/openlakehouse-io") })
+        .publishPost(input())
+        .catch((e) => e);
+      expect(error).to.be.instanceOf(GitHubError);
+      expect(error.message).to.contain("could not sync main of fork me/openlakehouse-io");
+      expect(error.message).to.contain("There are merge conflicts");
+      expect(fork.branches["obsidian/my-post"]).to.be.undefined;
+      expect(github.requestsMatching("PUT", "/repos/me/openlakehouse-io/contents/")).to.be.empty;
+      expect(github.requestsMatching("POST", `/repos/${TARGET}/pulls`)).to.be.empty;
+    });
+
+    it("fails if the fork still lacks the upstream commit after syncing", async () => {
+      github.addRepo("me/openlakehouse-io", { fork: { parent: TARGET } });
+      // Upstream moves on between the sync and the retry
+      const realRequest = github.requestUrl;
+      const gw = new GitHubGateway(
+        { token: github.token, targetRepo: parseRepo(TARGET)!, headRepo: parseRepo("me/openlakehouse-io"), baseBranch: "main" },
+        async (params) => {
+          const response = await realRequest(params);
+          if (params.url.endsWith("/merge-upstream")) {
+            github.repo("me/openlakehouse-io").branches.main = "f".repeat(40);
+          }
+          return response;
+        },
+      );
+      await gw.publishPost(input()).should.be.rejectedWith("not creating obsidian/my-post from stale history");
     });
 
     it("forks the target when no head repo is configured and the token can't push", async () => {
       github.repo(TARGET).push = false;
       github.forkReadyAfter = 2;
       const result = await gateway().publishPost(input());
-      expect(github.requestsMatching("POST", `/repos/${TARGET}/forks`)).to.have.length(1);
+      const forkRequests = github.requestsMatching("POST", `/repos/${TARGET}/forks`);
+      expect(forkRequests).to.have.length(1);
+      expect(forkRequests[0].body).not.to.have.property("default_branch_only");
       expect(result.headRepo).to.equal("octocat/openlakehouse-io");
       expect(github.file("octocat/openlakehouse-io", "obsidian/my-post", `${POST_DIR}/index.mdx`)).to.exist;
+    });
+
+    it("forks all branches, so a non-default base branch works", async () => {
+      const target = github.repo(TARGET);
+      target.push = false;
+      target.branches.release = "a".repeat(40);
+      target.files.release = {};
+      github.forkReadyAfter = 1;
+      const result = await gateway({ baseBranch: "release" }).publishPost(input());
+      expect(result.headRepo).to.equal("octocat/openlakehouse-io");
+      const refs = github.requestsMatching("POST", "/repos/octocat/openlakehouse-io/git/refs");
+      expect(refs.map((r) => r.body.sha)).to.deep.equal(["a".repeat(40)]);
+      expect(github.requestsMatching("POST", `/repos/${TARGET}/pulls`)[0].body.base).to.equal("release");
     });
 
     it("reuses an existing fork", async () => {

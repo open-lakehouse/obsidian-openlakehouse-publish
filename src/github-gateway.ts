@@ -168,9 +168,8 @@ export default class GitHubGateway implements PublishGateway {
       return { owner: login, repo: targetRepo.repo };
     }
     const created = await this.expect(
-      this.api("POST", `/repos/${repoName(targetRepo)}/forks`, {
-        default_branch_only: true,
-      }),
+      // All branches: the configured base branch need not be the default one
+      this.api("POST", `/repos/${repoName(targetRepo)}/forks`, {}),
       `forking ${repoName(targetRepo)}`,
       [200, 201, 202],
     );
@@ -235,11 +234,28 @@ export default class GitHubGateway implements PublishGateway {
       });
     let result = await create(baseSha);
     if (result.status === 422 && !sameRepo(head, targetRepo)) {
-      // The fork may not know the upstream commit yet; fall back to the
-      // fork's own copy of the base branch.
-      const forkBaseSha = await this.getBranchSha(head, baseBranch);
-      if (forkBaseSha) {
-        result = await create(forkBaseSha);
+      // The fork doesn't have the upstream commit yet. Sync the fork's base
+      // branch with upstream and retry at exactly the same commit - never
+      // start a pull request from the fork's (possibly stale) history.
+      const sync = await this.api(
+        "POST",
+        `/repos/${repoName(head)}/merge-upstream`,
+        { branch: baseBranch },
+      );
+      if (sync.status !== 200) {
+        const reason = (sync.json && sync.json.message) || "unexpected response";
+        throw new GitHubError(
+          `GitHub: could not sync ${baseBranch} of fork ${repoName(head)} with ${repoName(targetRepo)} (${sync.status}): ${reason}. ` +
+            `Sync the fork on GitHub (its ${baseBranch} branch must not have diverged), then try again.`,
+          sync.status,
+        );
+      }
+      result = await create(baseSha);
+      if (result.status === 422) {
+        throw new GitHubError(
+          `GitHub: fork ${repoName(head)} still doesn't contain ${repoName(targetRepo)}@${baseBranch} (${baseSha.substring(0, 7)}) after syncing; not creating ${branch} from stale history. Please try again shortly.`,
+          422,
+        );
       }
     }
     await this.expect(
