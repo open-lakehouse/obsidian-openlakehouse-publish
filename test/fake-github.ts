@@ -252,6 +252,18 @@ export class FakeGitHub {
         repo.branches[branch] = nextSha();
         return this.respond(existing ? 200 : 201, { content: { sha, path: filePath } });
       }
+      if (method === "DELETE") {
+        if (!repo.push) return this.respond(403, { message: "Resource not accessible" });
+        const files = repo.files[body.branch];
+        const existing = files?.[filePath];
+        if (!existing) return this.respond(404, { message: "Not Found" });
+        if (body.sha !== existing.sha) {
+          return this.respond(409, { message: "sha does not match" });
+        }
+        delete files[filePath];
+        repo.branches[body.branch] = nextSha();
+        return this.respond(200, { content: null });
+      }
     }
 
     if ((m = path.match(/^\/repos\/([^/]+)\/([^/]+)\/pulls$/))) {

@@ -27,6 +27,12 @@ export type PublishPostInput = {
   /** Used for commit messages and the pull request */
   title: string;
   pullRequestBody: string;
+  /**
+   * Repository paths uploaded by a previous run that are no longer part of
+   * the post. They are deleted from the branch if present. Callers must only
+   * pass paths they uploaded themselves.
+   */
+  deletePaths?: string[];
   /** PR number written to frontmatter by a previous run, if any */
   previousPullRequestNumber?: number;
 };
@@ -41,6 +47,8 @@ export type PublishPostResult = {
   pullRequestCreated: boolean;
   /** Repository paths that were actually written (unchanged files are skipped) */
   filesWritten: string[];
+  /** Repository paths that were deleted from the branch */
+  filesDeleted: string[];
 };
 
 /**

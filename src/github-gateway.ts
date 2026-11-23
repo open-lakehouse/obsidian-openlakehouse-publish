@@ -306,6 +306,38 @@ export default class GitHubGateway implements PublishGateway {
     return true;
   }
 
+  /** @returns true if the file existed on the branch and was deleted */
+  async deleteFile(
+    head: RepoRef,
+    branch: string,
+    path: string,
+    postTitle: string,
+  ): Promise<boolean> {
+    const contentsPath = `/repos/${repoName(head)}/contents/${encodePath(path)}`;
+    const existing = await this.api(
+      "GET",
+      `${contentsPath}?ref=${encodeURIComponent(branch)}`,
+    );
+    if (existing.status === 404) {
+      return false;
+    }
+    const json = await this.expect(Promise.resolve(existing), `reading ${path}`, [200]);
+    // Only ever delete a single file (a directory listing is an array)
+    if (!json || Array.isArray(json) || typeof json.sha !== "string") {
+      return false;
+    }
+    await this.expect(
+      this.api("DELETE", contentsPath, {
+        message: `Remove ${path.split("/").pop()} for "${postTitle}"`,
+        sha: json.sha,
+        branch,
+      }),
+      `deleting ${path}`,
+      [200],
+    );
+    return true;
+  }
+
   async ensurePullRequest(
     head: RepoRef,
     input: PublishPostInput,
@@ -372,6 +404,16 @@ export default class GitHubGateway implements PublishGateway {
         filesWritten.push(file.path);
       }
     }
+    const keep = new Set(input.files.map((f) => f.path));
+    const filesDeleted: string[] = [];
+    for (const path of input.deletePaths || []) {
+      if (keep.has(path) || filesDeleted.includes(path)) {
+        continue;
+      }
+      if (await this.deleteFile(head, input.branch, path, input.title)) {
+        filesDeleted.push(path);
+      }
+    }
     const pr = await this.ensurePullRequest(head, input);
     return {
       headRepo: repoName(head),
@@ -381,6 +423,7 @@ export default class GitHubGateway implements PublishGateway {
       branchCreated,
       pullRequestCreated: pr.created,
       filesWritten,
+      filesDeleted,
     };
   }
 }

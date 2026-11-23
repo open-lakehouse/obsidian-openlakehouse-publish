@@ -134,6 +134,7 @@ describe("GitHubGateway", () => {
         branchCreated: true,
         pullRequestCreated: true,
         filesWritten: [`${POST_DIR}/index.mdx`, `${POST_DIR}/diagram.png`],
+        filesDeleted: [],
       });
     });
 
@@ -202,6 +203,36 @@ describe("GitHubGateway", () => {
       );
       expect(result.pullRequestCreated).to.be.true;
       expect(result.pullRequestNumber).to.not.equal(first.pullRequestNumber);
+    });
+  });
+
+  describe("Deleting obsolete files", () => {
+    beforeEach(async () => {
+      await gateway().publishPost(input());
+      github.requests = [];
+    });
+
+    it("deletes requested paths from the branch with their sha", async () => {
+      const png = `${POST_DIR}/diagram.png`;
+      const sha = github.file(TARGET, "obsidian/my-post", png)!.sha;
+      const result = await gateway().publishPost(
+        input({ files: [input().files[0]], deletePaths: [png] }),
+      );
+      const deletes = github.requestsMatching("DELETE", `/repos/${TARGET}/contents/`);
+      expect(deletes).to.have.length(1);
+      expect(deletes[0].body).to.include({ sha, branch: "obsidian/my-post" });
+      expect(github.file(TARGET, "obsidian/my-post", png)).to.be.undefined;
+      expect(github.file(TARGET, "obsidian/my-post", `${POST_DIR}/index.mdx`)).to.exist;
+      expect(result.filesDeleted).to.deep.equal([png]);
+    });
+
+    it("skips paths that don't exist on the branch, and never deletes a path being written", async () => {
+      const result = await gateway().publishPost(
+        input({ deletePaths: [`${POST_DIR}/gone.png`, `${POST_DIR}/index.mdx`] }),
+      );
+      expect(github.requestsMatching("DELETE", "/")).to.be.empty;
+      expect(result.filesDeleted).to.be.empty;
+      expect(github.file(TARGET, "obsidian/my-post", `${POST_DIR}/index.mdx`)).to.exist;
     });
   });
 

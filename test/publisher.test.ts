@@ -345,7 +345,61 @@ describe("Publisher", () => {
         "ol-branch": "obsidian/post",
         "ol-pr-url": `https://github.com/${TARGET}/pull/42`,
         "ol-pr-number": 42,
+        "ol-files": [
+          "src/content/posts/iceberg/post/index.mdx",
+          "src/content/posts/iceberg/post/pic.png",
+        ],
         "ol-date": "2026-11-23",
+      });
+      expect(gateway.publishPost.firstCall.args[0].deletePaths).to.deep.equal([]);
+    });
+
+    describe("obsolete files", () => {
+      const root = "src/content/posts/iceberg";
+
+      it("asks to delete recorded files that are no longer part of the post", async () => {
+        const file = note("Body", {
+          "ol-path": `${root}/post/index.mdx`,
+          "ol-files": [`${root}/post/index.mdx`, `${root}/post/old.png`, `${root}/post/thumbnail.png`],
+        }, "Post.md");
+        await publisher.publish(file);
+        expect(gateway.publishPost.firstCall.args[0].deletePaths).to.deep.equal([
+          `${root}/post/old.png`,
+          `${root}/post/thumbnail.png`,
+        ]);
+        expect(file.frontmatter["ol-files"]).to.deep.equal([`${root}/post/index.mdx`]);
+      });
+
+      it("deletes the old location after a slug or category change, even without ol-files", async () => {
+        const file = note("Body", {
+          "ol-path": `${root}/old-slug/index.mdx`,
+          "ol-category": "delta-lake",
+          slug: "new-slug",
+        });
+        await publisher.publish(file);
+        const args = gateway.publishPost.firstCall.args[0];
+        expect(args.files.map((f) => f.path)).to.deep.equal([
+          "src/content/posts/delta-lake/new-slug/index.mdx",
+        ]);
+        expect(args.deletePaths).to.deep.equal([`${root}/old-slug/index.mdx`]);
+      });
+
+      it("ignores recorded paths outside the posts directory or with traversal", async () => {
+        const file = note("Body", {
+          "ol-path": `${root}/post/index.mdx`,
+          "ol-files": [
+            "README.md",
+            "src/content/authors/me.mdx",
+            `${root}/post/../../../../../package.json`,
+            `${root}//x.png`,
+            42,
+            `${root}/post/real.png`,
+          ],
+        }, "Post.md");
+        await publisher.publish(file);
+        expect(gateway.publishPost.firstCall.args[0].deletePaths).to.deep.equal([
+          `${root}/post/real.png`,
+        ]);
       });
     });
 
@@ -400,6 +454,42 @@ describe("Publisher", () => {
       // Only the changed index.mdx is written; the unchanged image is skipped
       expect(github.requestsMatching("PUT", `/repos/${TARGET}/contents/`)).to.have.length(1);
       expect(github.requestsMatching("POST", `/repos/${TARGET}/git/refs`)).to.be.empty;
+    });
+
+    it("removes images, thumbnails and old directories on republish, but nothing it didn't upload", async () => {
+      const github = new FakeGitHub();
+      github.addRepo(TARGET);
+      const gw = new GitHubGateway(
+        { token: github.token, targetRepo: parseRepo(TARGET)!, baseBranch: "main" },
+        github.requestUrl,
+      );
+      const p = createPublisher(app, gw);
+      const file = note("# Moving\n\n![[a.png]] ![[b.png]]", { "ol-thumbnail": "[[cover.jpg]]" }, "Moving.md");
+      app.metadataCache.setLinkTarget("a.png", file.path, image("a.png"));
+      app.metadataCache.setLinkTarget("b.png", file.path, image("b.png"));
+      app.metadataCache.setLinkTarget("cover.jpg", file.path, image("cover.jpg"));
+      await p.publish(file);
+
+      const branch = "obsidian/moving";
+      const oldDir = "src/content/posts/iceberg/moving";
+      // A maintainer adds a file to the post directory on the branch
+      github.repo(TARGET).files[branch][`${oldDir}/maintainer.png`] = { sha: "m".repeat(40), content: "" };
+      expect(Object.keys(github.repo(TARGET).files[branch]).sort()).to.deep.equal(
+        [`${oldDir}/a.png`, `${oldDir}/b.png`, `${oldDir}/index.mdx`, `${oldDir}/maintainer.png`, `${oldDir}/thumbnail.jpg`],
+      );
+
+      // Drop image b and the thumbnail, and move the post to another category
+      file.contents = "# Moving\n\n![[a.png]]";
+      delete file.frontmatter["ol-thumbnail"];
+      file.frontmatter["ol-category"] = "agentic";
+      await p.publish(file);
+
+      const newDir = "src/content/posts/agentic/moving";
+      expect(Object.keys(github.repo(TARGET).files[branch]).sort()).to.deep.equal(
+        [`${newDir}/a.png`, `${newDir}/index.mdx`, `${oldDir}/maintainer.png`],
+      );
+      expect(file.frontmatter["ol-files"]).to.deep.equal([`${newDir}/index.mdx`, `${newDir}/a.png`]);
+      expect(github.pulls[TARGET]).to.have.length(1);
     });
   });
 

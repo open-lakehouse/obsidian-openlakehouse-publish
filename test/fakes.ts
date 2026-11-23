@@ -200,6 +200,7 @@ export const defaultPublishResult = (
   branchCreated: true,
   pullRequestCreated: true,
   filesWritten: [],
+  filesDeleted: [],
   ...input,
 });
 

@@ -31,6 +31,8 @@ export const OL_BRANCH_KEY = "ol-branch";
 export const OL_PR_URL_KEY = "ol-pr-url";
 export const OL_PR_NUMBER_KEY = "ol-pr-number";
 export const OL_DATE_KEY = "ol-date";
+/** Every repository path uploaded by the last publish (index.mdx + images) */
+export const OL_FILES_KEY = "ol-files";
 
 export const IMAGE_EXTENSIONS = [
   "png",
@@ -540,6 +542,35 @@ export default class Publisher<TFile extends { path: string }> {
     });
   }
 
+  /**
+   * Paths the plugin uploaded on a previous run (recorded in `ol-files`, plus
+   * the `ol-path` index.mdx) that are not part of the post any more, e.g. a
+   * removed image or thumbnail, or the old location after a slug/category
+   * change. Only recorded paths inside the posts directory are returned, so
+   * nothing the plugin didn't upload is ever deleted.
+   */
+  obsoletePaths(fm: JsonObject, currentPaths: string[]): string[] {
+    const recorded = [
+      ...(Array.isArray(fm[OL_FILES_KEY]) ? (fm[OL_FILES_KEY] as Json[]) : []),
+      fm[OL_PATH_KEY],
+    ];
+    const root = `${this.config.postsRoot.replace(/\/$/, "")}/`;
+    const current = new Set(currentPaths);
+    const result: string[] = [];
+    for (const path of recorded) {
+      if (
+        isString(path) &&
+        path.startsWith(root) &&
+        !path.split("/").some((seg) => seg === ".." || seg === "." || seg === "") &&
+        !current.has(path) &&
+        !result.includes(path)
+      ) {
+        result.push(path);
+      }
+    }
+    return result;
+  }
+
   async publish(file: TFile): Promise<PublishPostResult> {
     const fm = this.getFrontMatter(file) || {};
     const post = await this.generatePost(file);
@@ -552,6 +583,8 @@ export default class Publisher<TFile extends { path: string }> {
         content: await this.vault.readBinary(asset.file),
       });
     }
+    const currentPaths = files.map((f) => f.path);
+    const deletePaths = this.obsoletePaths(fm, currentPaths);
     const previousBranch = fm[OL_BRANCH_KEY];
     const previousPr = fm[OL_PR_NUMBER_KEY];
     const result = await this.gateway.publishPost({
@@ -560,6 +593,7 @@ export default class Publisher<TFile extends { path: string }> {
           ? previousBranch.trim()
           : `obsidian/${post.slug}`,
       files,
+      deletePaths,
       title: post.title,
       pullRequestBody: [
         `Adds/updates the post **${post.title}** at \`${post.directory}/index.mdx\`.`,
@@ -574,6 +608,7 @@ export default class Publisher<TFile extends { path: string }> {
       [OL_BRANCH_KEY]: result.branch,
       [OL_PR_URL_KEY]: result.pullRequestUrl,
       [OL_PR_NUMBER_KEY]: result.pullRequestNumber,
+      [OL_FILES_KEY]: currentPaths,
     };
     if (!toIsoDate(this.fmValue(fm, "date"))) {
       // Pin the date so re-publishing doesn't move the post
