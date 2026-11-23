@@ -11,6 +11,7 @@ import {
 import GitHubGateway, { parseRepo } from "src/github-gateway";
 import { GetFrontMatterInfo } from "src/obsidian-implementations";
 import Publisher from "src/publisher";
+import { InFlightGuard } from "src/in-flight";
 
 export interface OpenLakehousePluginSettings {
   /** Fine-grained (or classic) GitHub personal access token */
@@ -38,6 +39,7 @@ export const DEFAULT_SETTINGS: OpenLakehousePluginSettings = {
 
 export default class PublishToOpenLakehousePlugin extends Plugin {
   settings: OpenLakehousePluginSettings;
+  private publishing = new InFlightGuard();
 
   async onload() {
     await this.loadSettings();
@@ -59,8 +61,14 @@ export default class PublishToOpenLakehousePlugin extends Plugin {
             new Notice(`Publish to OpenLakehouse: ${(err as Error).message}`, 0);
             return true;
           }
+          if (this.publishing.isRunning(file.path)) {
+            new Notice(
+              `Publish to OpenLakehouse: "${file.basename}" is already being published. Please wait for it to finish.`,
+            );
+            return true;
+          }
           const notice = new Notice("Publishing to OpenLakehouse…", 0);
-          publisher.publish(file).then(
+          this.publishing.run(file.path, () => publisher.publish(file))?.then(
             (result) => {
               notice.hide();
               new Notice(
