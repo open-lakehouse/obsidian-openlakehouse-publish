@@ -12,13 +12,16 @@ import {
 } from "src/interfaces";
 import { GetFrontMatterInfo } from "src/obsidian-implementations";
 import Publisher, { JsonObject } from "src/publisher";
-import MediumGateway from "src/medium-gateway";
+import type { PublishGateway, PublishPostResult } from "src/gateway";
+import { PublisherConfig } from "src/publisher";
 import { createFakeFile } from "./factories";
 
 export type FakeFile = {
   path: string;
   frontmatter: JsonObject;
   contents: string;
+  /** Binary contents, for image files */
+  binary?: Uint8Array;
 };
 
 export class FakeFileManager implements GenericFileManager<FakeFile> {
@@ -34,6 +37,13 @@ export class FakeFileManager implements GenericFileManager<FakeFile> {
 export class FakeVault implements GenericVault<FakeFile> {
   async read(file: FakeFile) {
     return Promise.resolve(file.contents);
+  }
+  async readBinary(file: FakeFile): Promise<ArrayBuffer> {
+    const bytes = file.binary || new TextEncoder().encode(file.contents);
+    return bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength,
+    ) as ArrayBuffer;
   }
 }
 
@@ -93,7 +103,7 @@ export const getLinks = (data: string) => {
   const links: LinkCache[] = [];
 
   const matches = data.matchAll(
-    /[^!](?<original>\[{2}(?<link>[^\]|]+)(?:\|(?<alias>[^\]]*))?\]\])/g,
+    /(?<!!)(?<original>\[{2}(?<link>[^\]|]+)(?:\|(?<alias>[^\]]*))?\]\])/g,
   );
   for (const match of matches) {
     const link = match.groups!.link;
@@ -105,7 +115,7 @@ export const getLinks = (data: string) => {
       displayText,
       original,
       position: {
-        start: { offset: index + 1 },
+        start: { offset: index },
         end: { offset: index + match[0].length },
       },
     });
@@ -146,7 +156,7 @@ export class FakeMetadataCache implements GenericMetadataCache<FakeFile> {
 
 export class FakeGetFrontMatterInfo implements GetFrontMatterInfo {
   getFrontMatterInfo(contents: string): FrontMatterInfo {
-    const matches = /^---[^-]+---/.exec(contents);
+    const matches = /^---\n(?:[\s\S]*?\n)?---(?:\n|$)/.exec(contents);
     if (!matches) {
       return {
         exists: false,
@@ -180,16 +190,47 @@ export class FakeApp implements GenericApp<FakeFile> {
   }
 }
 
+export const defaultPublishResult = (
+  input?: Partial<PublishPostResult>,
+): PublishPostResult => ({
+  headRepo: "open-lakehouse/openlakehouse-io",
+  branch: "obsidian/post",
+  pullRequestNumber: 1,
+  pullRequestUrl: "https://github.com/open-lakehouse/openlakehouse-io/pull/1",
+  branchCreated: true,
+  pullRequestCreated: true,
+  filesWritten: [],
+  ...input,
+});
+
 export const createGatewayStubWithDefaults = () => {
-  const result = sinon.createStubInstance(MediumGateway);
-  result.getArticleStatus.resolves({ published: false });
-  return result;
+  const publishPost = sinon.stub<
+    Parameters<PublishGateway["publishPost"]>,
+    ReturnType<PublishGateway["publishPost"]>
+  >();
+  publishPost.callsFake(async (input) =>
+    defaultPublishResult({ branch: input.branch }),
+  );
+  return { publishPost };
 };
 
-export const createPublisher = (app: FakeApp, gateway?: MediumGateway) => {
+export type GatewayStub = ReturnType<typeof createGatewayStubWithDefaults>;
+
+export const TEST_CONFIG: Partial<PublisherConfig> = {
+  defaultCategory: "iceberg",
+  defaultAuthors: ["scott-haines"],
+  today: () => "2026-11-23",
+};
+
+export const createPublisher = (
+  app: FakeApp,
+  gateway?: PublishGateway,
+  config?: Partial<PublisherConfig>,
+) => {
   return new Publisher(
     app,
     gateway || createGatewayStubWithDefaults(),
     new FakeGetFrontMatterInfo(),
+    { ...TEST_CONFIG, ...config },
   );
 };

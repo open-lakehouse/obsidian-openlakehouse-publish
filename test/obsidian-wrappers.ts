@@ -1,5 +1,5 @@
 import type { requestUrl } from "obsidian";
-import { HttpResponse } from "src/medium-gateway";
+import { HttpResponse } from "src/gateway";
 
 type RequestUrl = typeof requestUrl;
 
