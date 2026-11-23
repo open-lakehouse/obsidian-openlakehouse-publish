@@ -273,18 +273,38 @@ describe("GitHubGateway", () => {
       expect(result.deletesSkipped).to.deep.equal([other]);
     });
 
-    it("treats a concurrent change (409 on delete) as modified and leaves it", async () => {
-      const real = github.requestUrl;
-      const gw = new GitHubGateway(
-        { token: github.token, targetRepo: parseRepo(TARGET)!, baseBranch: "main" },
-        async (params) =>
-          params.method === "DELETE" ? { status: 409, json: Promise.resolve({ message: "sha mismatch" }) } : real(params),
+    for (const status of [409, 422]) {
+      it(`treats a concurrent change (${status} on delete) as modified and leaves it`, async () => {
+        github.nextDeleteResponse = {
+          status,
+          message: "sha mismatch",
+          mutate: (files, path) => {
+            files[path] = { sha: "e".repeat(40), content: "ZWRpdGVk" };
+          },
+        };
+        const result = await gateway().publishPost(
+          input({ files: [input().files[0]], deleteFiles: [{ path: png, sha: first.fileShas[png] }] }),
+        );
+        expect(result.deletesSkipped).to.deep.equal([png]);
+        expect(result.filesDeleted).to.be.empty;
+        expect(github.file(TARGET, "obsidian/my-post", png)!.sha).to.equal("e".repeat(40));
+      });
+    }
+
+    it("fails with the original GitHub error when a 422 delete leaves the same blob", async () => {
+      github.nextDeleteResponse = { status: 422, message: "Validation Failed" };
+      const error = await gateway()
+        .publishPost(
+          input({ files: [input().files[0]], deleteFiles: [{ path: png, sha: first.fileShas[png] }] }),
+        )
+        .catch((e) => e);
+      expect(error).to.be.instanceOf(GitHubError);
+      expect(error.status).to.equal(422);
+      expect(error.message).to.equal(
+        `GitHub: deleting ${png} failed (422): Validation Failed`,
       );
-      const result = await gw.publishPost(
-        input({ files: [input().files[0]], deleteFiles: [{ path: png, sha: first.fileShas[png] }] }),
-      );
-      expect(result.deletesSkipped).to.deep.equal([png]);
-      expect(result.filesDeleted).to.be.empty;
+      expect(github.file(TARGET, "obsidian/my-post", png)!.sha).to.equal(first.fileShas[png]);
+      expect(github.requestsMatching("POST", `/repos/${TARGET}/pulls`)).to.be.empty;
     });
 
     it("skips paths that don't exist on the branch, and never deletes a path being written", async () => {

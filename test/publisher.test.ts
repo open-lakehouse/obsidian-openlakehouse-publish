@@ -510,6 +510,46 @@ describe("Publisher", () => {
       expect(github.requestsMatching("POST", `/repos/${TARGET}/git/refs`)).to.be.empty;
     });
 
+    it("finishes publishing when an obsolete file disappears during deletion", async () => {
+      const github = new FakeGitHub();
+      github.addRepo(TARGET);
+      const gw = new GitHubGateway(
+        { token: github.token, targetRepo: parseRepo(TARGET)!, baseBranch: "main" },
+        github.requestUrl,
+      );
+      const p = createPublisher(app, gw);
+      const file = note("# Race\n\n![[gone.png]]", {}, "Race.md");
+      app.metadataCache.setLinkTarget("gone.png", file.path, image("gone.png"));
+      await p.publish(file);
+
+      const path = "src/content/posts/iceberg/race/gone.png";
+      const previousPrUrl = file.frontmatter["ol-pr-url"];
+      file.contents = "# Race\n\nUpdated";
+      github.pulls[TARGET][0].state = "closed";
+      github.nextDeleteResponse = {
+        status: 404,
+        message: "Not Found",
+        mutate: (files, deletePath) => {
+          delete files[deletePath];
+        },
+      };
+
+      const result = await p.publish(file);
+
+      expect(result.filesDeleted).to.be.empty;
+      expect(result.deletesSkipped).to.be.empty;
+      expect(github.file(TARGET, "obsidian/race", path)).to.be.undefined;
+      expect(github.pulls[TARGET]).to.have.length(2);
+      expect(file.frontmatter["ol-pr-url"]).to.not.equal(previousPrUrl);
+      expect(file.frontmatter["ol-pr-number"]).to.equal(101);
+      expect(file.frontmatter["ol-files"]).to.deep.equal([
+        {
+          path: "src/content/posts/iceberg/race/index.mdx",
+          sha: github.file(TARGET, "obsidian/race", "src/content/posts/iceberg/race/index.mdx")!.sha,
+        },
+      ]);
+    });
+
     it("after merge + branch recreation, deletes only files still byte-identical to the plugin's upload", async () => {
       const github = new FakeGitHub();
       const repo = github.addRepo(TARGET);
