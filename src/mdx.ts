@@ -6,6 +6,8 @@
  * into the replace-instruction engine in `publisher.ts`.
  */
 
+import { analyzeMarkdown } from "./markdown-ast";
+
 export type ReplaceInstruction = {
   from: number;
   to: number;
@@ -44,62 +46,12 @@ export const applyReplaceInstructions = (
 };
 
 /**
- * Finds fenced code blocks and inline code spans, starting at `start`. Content
- * in these ranges must be left byte-for-byte untouched.
- *
- * Indented code blocks are deliberately not detected: MDX does not support
- * them, so their contents are parsed as prose and need escaping too.
+ * Code ranges (fenced, indented and inline code), found by actually parsing
+ * the markdown, starting at `start`. Content in these ranges must not be
+ * touched by text-level rewrites (comments, callouts, escaping).
  */
-export const findCodeRanges = (text: string, start = 0): Range[] => {
-  const ranges: Range[] = [];
-  const fenceOpen = /^ {0,3}(`{3,}|~{3,})[^\n]*$/gm;
-  let pos = start;
-  const prose: Range[] = [];
-  fenceOpen.lastIndex = start;
-  let match: RegExpExecArray | null;
-  while ((match = fenceOpen.exec(text))) {
-    const fence = match[1];
-    // A backtick fence's info string may not contain backticks
-    const info = match[0].trimStart().substring(fence.length);
-    if (fence[0] === "`" && info.includes("`")) {
-      continue;
-    }
-    const blockStart = match.index;
-    const closeRe = new RegExp(
-      `^ {0,3}${fence[0] === "`" ? "`" : "~"}{${fence.length},}[ \\t]*$`,
-      "gm",
-    );
-    closeRe.lastIndex = blockStart + match[0].length;
-    const close = closeRe.exec(text);
-    const blockEnd = close ? close.index + close[0].length : text.length;
-    prose.push({ from: pos, to: blockStart });
-    ranges.push({ from: blockStart, to: blockEnd });
-    pos = blockEnd;
-    fenceOpen.lastIndex = blockEnd;
-  }
-  prose.push({ from: pos, to: text.length });
-
-  for (const { from, to } of prose) {
-    const segment = text.substring(from, to);
-    const runs = [...segment.matchAll(/`+/g)];
-    for (let i = 0; i < runs.length; i++) {
-      const open = runs[i];
-      const closeIndex = runs.findIndex(
-        (r, j) => j > i && r[0].length === open[0].length,
-      );
-      if (closeIndex === -1) {
-        continue;
-      }
-      const close = runs[closeIndex];
-      ranges.push({
-        from: from + open.index!,
-        to: from + close.index! + close[0].length,
-      });
-      i = closeIndex;
-    }
-  }
-  return ranges.sort((a, b) => a.from - b.from);
-};
+export const findCodeRanges = (text: string, start = 0): Range[] =>
+  analyzeMarkdown(text, start).codeRanges;
 
 /** Escapes characters that MDX would treat as JSX/expression syntax. */
 export const escapeMdxText = (text: string) =>
@@ -181,34 +133,6 @@ export const calloutInstructions = (
       from: match.index,
       to: match.index + whole.length,
       replaceString: `${prefix}**${heading}**`,
-    });
-  }
-  return result;
-};
-
-/**
- * MDX does not support autolinks (`<https://example.com>`), so they are
- * rewritten to regular markdown links.
- */
-export const autolinkInstructions = (
-  text: string,
-  start: number,
-  codeRanges: Range[],
-): ReplaceInstruction[] => {
-  const result: ReplaceInstruction[] = [];
-  const re = /<((?:https?|mailto):[^\s<>]+)>/g;
-  re.lastIndex = start;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text))) {
-    if (inRanges(codeRanges, match.index)) {
-      continue;
-    }
-    const url = match[1];
-    const label = url.replace(/^mailto:/, "");
-    result.push({
-      from: match.index,
-      to: match.index + match[0].length,
-      replaceString: `[${label}](${url})`,
     });
   }
   return result;

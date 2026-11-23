@@ -11,17 +11,16 @@ import {
   Range,
   ReplaceInstruction,
   applyReplaceInstructions,
-  autolinkInstructions,
   calloutInstructions,
   commentInstructions,
   deriveExcerpt,
   escapeInstructions,
   escapeMdxText,
-  findCodeRanges,
   safeFileName,
   slugify,
   toYamlFrontmatter,
 } from "./mdx";
+import { analyzeMarkdown, MarkdownImage } from "./markdown-ast";
 
 export type JsonObject = { [key: string]: Json };
 export type Json = string | number | boolean | null | Json[] | JsonObject;
@@ -232,10 +231,8 @@ export default class Publisher<TFile extends { path: string }> {
    */
   processImages(
     file: TFile,
-    text: string,
     md: CachedMetadata | null,
-    bodyStart: number,
-    codeRanges: Range[],
+    markdownImages: MarkdownImage[],
     reservedNames: Set<string>,
   ) {
     type Embed = { from: number; to: number; link: string; alt?: string };
@@ -245,25 +242,17 @@ export default class Publisher<TFile extends { path: string }> {
       link: e.link,
       alt: e.displayText,
     }));
-    const mdImage = /!\[([^\]]*)\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+"[^"]*")?\s*\)/g;
-    mdImage.lastIndex = bodyStart;
-    let match: RegExpExecArray | null;
-    while ((match = mdImage.exec(text))) {
-      const from = match.index;
-      if (embeds.some((e) => e.from === from) || codeRanges.some((r) => from >= r.from && from < r.to)) {
+    for (const image of markdownImages) {
+      if (embeds.some((e) => e.from === image.from) || isRemote(image.url)) {
         continue;
       }
-      const rawLink = match[2].replace(/^<|>$/g, "");
-      if (isRemote(rawLink)) {
-        continue;
-      }
-      let link = rawLink;
+      let link = image.url;
       try {
-        link = decodeURI(rawLink);
+        link = decodeURI(image.url);
       } catch {
-        // keep raw
+        // keep as written
       }
-      embeds.push({ from, to: from + match[0].length, link, alt: match[1] });
+      embeds.push({ from: image.from, to: image.to, link, alt: image.alt });
     }
 
     const instructions: ReplaceInstruction[] = [];
@@ -352,7 +341,8 @@ export default class Publisher<TFile extends { path: string }> {
     const metadata = this.app.metadataCache.getFileCache(file);
     const fmInfo = this.getFrontMatterInfo.getFrontMatterInfo(text);
     const bodyStart = fmInfo.exists ? fmInfo.contentStart : 0;
-    const codeRanges = findCodeRanges(text, bodyStart);
+    const analysis = analyzeMarkdown(text, bodyStart);
+    const { codeRanges } = analysis;
 
     const { h1 } = this.generateTitle(file);
     const structural: ReplaceInstruction[] = [
@@ -362,10 +352,8 @@ export default class Publisher<TFile extends { path: string }> {
     ];
     const { instructions: imageInstructions, assets } = this.processImages(
       file,
-      text,
       metadata,
-      bodyStart,
-      codeRanges,
+      analysis.images,
       reservedNames,
     );
     const instructions = [
@@ -374,9 +362,13 @@ export default class Publisher<TFile extends { path: string }> {
       ...this.processLinks(file, metadata),
       ...imageInstructions,
       ...calloutInstructions(text, bodyStart, codeRanges),
-      ...autolinkInstructions(text, bodyStart, codeRanges),
+      // indented code -> fenced code, <autolinks> -> [links](…)
+      ...analysis.instructions,
     ];
-    const protectedRanges: Range[] = [...codeRanges, ...instructions];
+    const protectedRanges: Range[] = [
+      ...analysis.protectedRanges,
+      ...instructions,
+    ];
     instructions.push(...escapeInstructions(text, bodyStart, protectedRanges));
 
     const body = applyReplaceInstructions(instructions, text)
