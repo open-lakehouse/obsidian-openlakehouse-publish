@@ -39,6 +39,14 @@ export type RecordedRequest = {
   body?: any;
 };
 
+type FakeFileMap = Record<string, { sha: string; content: string }>;
+
+type DeleteResponse = {
+  status: number;
+  message: string;
+  mutate?: (files: FakeFileMap, path: string) => void;
+};
+
 let shaCounter = 1;
 const nextSha = () => (shaCounter++).toString(16).padStart(40, "0");
 
@@ -50,6 +58,8 @@ export class FakeGitHub {
   token = "TOKEN";
   /** Number of ref lookups a new fork answers with 404 before being ready */
   forkReadyAfter = 0;
+  /** One-shot DELETE response used to simulate races in gateway tests. */
+  nextDeleteResponse?: DeleteResponse;
   private forkLookups = 0;
 
   addRepo(fullName: string, opts: Partial<FakeRepo> = {}) {
@@ -255,6 +265,12 @@ export class FakeGitHub {
       if (method === "DELETE") {
         if (!repo.push) return this.respond(403, { message: "Resource not accessible" });
         const files = repo.files[body.branch];
+        if (this.nextDeleteResponse) {
+          const response = this.nextDeleteResponse;
+          this.nextDeleteResponse = undefined;
+          response.mutate?.(files, filePath);
+          return this.respond(response.status, { message: response.message });
+        }
         const existing = files?.[filePath];
         if (!existing) return this.respond(404, { message: "Not Found" });
         if (body.sha !== existing.sha) {

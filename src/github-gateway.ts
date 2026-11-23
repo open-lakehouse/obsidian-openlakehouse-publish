@@ -341,8 +341,22 @@ export default class GitHubGateway implements PublishGateway {
       sha: file.sha,
       branch,
     });
-    if (result.status === 409) {
-      return "changed";
+    if ([404, 409, 422].includes(result.status)) {
+      const current = await this.api(
+        "GET",
+        `${contentsPath}?ref=${encodeURIComponent(branch)}`,
+      );
+      if (current.status === 404) {
+        return "missing";
+      }
+      const currentJson = await this.expect(
+        Promise.resolve(current),
+        `reading ${file.path}`,
+        [200],
+      );
+      if (!currentJson || Array.isArray(currentJson) || currentJson.sha !== file.sha) {
+        return "changed";
+      }
     }
     await this.expect(Promise.resolve(result), `deleting ${file.path}`, [200]);
     return "deleted";
