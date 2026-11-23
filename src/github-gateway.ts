@@ -266,13 +266,13 @@ export default class GitHubGateway implements PublishGateway {
     return true;
   }
 
-  /** @returns true if the file was written, false if it was unchanged */
+  /** @returns the blob sha now on the branch, and whether the file was written */
   async upsertFile(
     head: RepoRef,
     branch: string,
     file: PublishFile,
     postTitle: string,
-  ): Promise<boolean> {
+  ): Promise<{ written: boolean; sha: string }> {
     const contentsPath = `/repos/${repoName(head)}/contents/${encodePath(file.path)}`;
     const existing = await this.api(
       "GET",
@@ -291,9 +291,9 @@ export default class GitHubGateway implements PublishGateway {
       typeof existing.json?.content === "string" &&
       existing.json.content.replace(/\s/g, "") === content
     ) {
-      return false;
+      return { written: false, sha: sha as string };
     }
-    await this.expect(
+    const put = await this.expect(
       this.api("PUT", contentsPath, {
         message: `${sha ? "Update" : "Add"} ${file.path.split("/").pop()} for "${postTitle}"`,
         content,
@@ -303,39 +303,49 @@ export default class GitHubGateway implements PublishGateway {
       `writing ${file.path}`,
       [200, 201],
     );
-    return true;
+    const newSha = put?.content?.sha;
+    if (typeof newSha !== "string") {
+      throw new GitHubError(`GitHub: writing ${file.path} returned no blob sha`, 502);
+    }
+    return { written: true, sha: newSha };
   }
 
-  /** @returns true if the file existed on the branch and was deleted */
-  async deleteFile(
+  /**
+   * Deletes `file.path` from the branch, but only if the blob on the branch
+   * still has the sha the plugin recorded when uploading it.
+   * @returns "deleted", "missing" (not on the branch) or "changed" (content
+   * differs from what the plugin uploaded - left alone)
+   */
+  async deleteOwnedFile(
     head: RepoRef,
     branch: string,
-    path: string,
+    file: { path: string; sha: string },
     postTitle: string,
-  ): Promise<boolean> {
-    const contentsPath = `/repos/${repoName(head)}/contents/${encodePath(path)}`;
+  ): Promise<"deleted" | "missing" | "changed"> {
+    const contentsPath = `/repos/${repoName(head)}/contents/${encodePath(file.path)}`;
     const existing = await this.api(
       "GET",
       `${contentsPath}?ref=${encodeURIComponent(branch)}`,
     );
     if (existing.status === 404) {
-      return false;
+      return "missing";
     }
-    const json = await this.expect(Promise.resolve(existing), `reading ${path}`, [200]);
-    // Only ever delete a single file (a directory listing is an array)
-    if (!json || Array.isArray(json) || typeof json.sha !== "string") {
-      return false;
+    const json = await this.expect(Promise.resolve(existing), `reading ${file.path}`, [200]);
+    // Never delete a directory (listing is an array) or modified content
+    if (!json || Array.isArray(json) || json.sha !== file.sha) {
+      return "changed";
     }
-    await this.expect(
-      this.api("DELETE", contentsPath, {
-        message: `Remove ${path.split("/").pop()} for "${postTitle}"`,
-        sha: json.sha,
-        branch,
-      }),
-      `deleting ${path}`,
-      [200],
-    );
-    return true;
+    const result = await this.api("DELETE", contentsPath, {
+      message: `Remove ${file.path.split("/").pop()} for "${postTitle}"`,
+      // GitHub rejects the delete if the file changed since we looked
+      sha: file.sha,
+      branch,
+    });
+    if (result.status === 409) {
+      return "changed";
+    }
+    await this.expect(Promise.resolve(result), `deleting ${file.path}`, [200]);
+    return "deleted";
   }
 
   async ensurePullRequest(
@@ -393,25 +403,32 @@ export default class GitHubGateway implements PublishGateway {
     const head = await this.resolveHeadRepo();
     const branchCreated = await this.ensureBranch(head, input.branch);
     const filesWritten: string[] = [];
+    const fileShas: Record<string, string> = {};
     for (const file of input.files) {
-      const written = await this.upsertFile(
+      const { written, sha } = await this.upsertFile(
         head,
         input.branch,
         file,
         input.title,
       );
+      fileShas[file.path] = sha;
       if (written) {
         filesWritten.push(file.path);
       }
     }
-    const keep = new Set(input.files.map((f) => f.path));
     const filesDeleted: string[] = [];
-    for (const path of input.deletePaths || []) {
-      if (keep.has(path) || filesDeleted.includes(path)) {
+    const deletesSkipped: string[] = [];
+    const seen = new Set(input.files.map((f) => f.path));
+    for (const file of input.deleteFiles || []) {
+      if (seen.has(file.path)) {
         continue;
       }
-      if (await this.deleteFile(head, input.branch, path, input.title)) {
-        filesDeleted.push(path);
+      seen.add(file.path);
+      const outcome = await this.deleteOwnedFile(head, input.branch, file, input.title);
+      if (outcome === "deleted") {
+        filesDeleted.push(file.path);
+      } else if (outcome === "changed") {
+        deletesSkipped.push(file.path);
       }
     }
     const pr = await this.ensurePullRequest(head, input);
@@ -424,6 +441,8 @@ export default class GitHubGateway implements PublishGateway {
       pullRequestCreated: pr.created,
       filesWritten,
       filesDeleted,
+      deletesSkipped,
+      fileShas,
     };
   }
 }

@@ -5,7 +5,12 @@ import {
   GenericVault,
   GetFrontMatterInfo,
 } from "./interfaces";
-import type { PublishFile, PublishGateway, PublishPostResult } from "./gateway";
+import type {
+  OwnedFile,
+  PublishFile,
+  PublishGateway,
+  PublishPostResult,
+} from "./gateway";
 import {
   FrontmatterEntry,
   Range,
@@ -31,7 +36,12 @@ export const OL_BRANCH_KEY = "ol-branch";
 export const OL_PR_URL_KEY = "ol-pr-url";
 export const OL_PR_NUMBER_KEY = "ol-pr-number";
 export const OL_DATE_KEY = "ol-date";
-/** Every repository path uploaded by the last publish (index.mdx + images) */
+/**
+ * Every file uploaded by the last publish (index.mdx + images), as a list of
+ * `{path, sha}` where sha is the git blob sha GitHub returned for the upload.
+ * The sha is the proof of ownership: an obsolete file is only deleted while
+ * the branch still holds exactly that blob.
+ */
 export const OL_FILES_KEY = "ol-files";
 
 export const IMAGE_EXTENSIONS = [
@@ -543,32 +553,45 @@ export default class Publisher<TFile extends { path: string }> {
   }
 
   /**
-   * Paths the plugin uploaded on a previous run (recorded in `ol-files`, plus
-   * the `ol-path` index.mdx) that are not part of the post any more, e.g. a
+   * Files from a previous run (recorded in `ol-files`, plus the legacy
+   * `ol-path` index.mdx) that are not part of the post any more, e.g. a
    * removed image or thumbnail, or the old location after a slug/category
-   * change. Only recorded paths inside the posts directory are returned, so
-   * nothing the plugin didn't upload is ever deleted.
+   * change. Only paths inside the posts directory are considered.
+   *
+   * - `owned`: entries recorded with the blob sha of the upload; they may be
+   *   deleted, if the branch still holds that exact blob.
+   * - `unowned`: legacy entries (plain strings, `ol-path` alone) without
+   *   provenance; these are never deleted automatically.
    */
-  obsoletePaths(fm: JsonObject, currentPaths: string[]): string[] {
-    const recorded = [
-      ...(Array.isArray(fm[OL_FILES_KEY]) ? (fm[OL_FILES_KEY] as Json[]) : []),
-      fm[OL_PATH_KEY],
-    ];
+  obsoleteFiles(fm: JsonObject, currentPaths: string[]) {
     const root = `${this.config.postsRoot.replace(/\/$/, "")}/`;
     const current = new Set(currentPaths);
-    const result: string[] = [];
-    for (const path of recorded) {
-      if (
-        isString(path) &&
-        path.startsWith(root) &&
-        !path.split("/").some((seg) => seg === ".." || seg === "." || seg === "") &&
-        !current.has(path) &&
-        !result.includes(path)
-      ) {
-        result.push(path);
+    const inScope = (path: unknown): path is string =>
+      isString(path) &&
+      path.startsWith(root) &&
+      !path.split("/").some((seg) => seg === ".." || seg === "." || seg === "") &&
+      !current.has(path);
+
+    const owned: OwnedFile[] = [];
+    const unowned: string[] = [];
+    const seen = new Set<string>();
+    const recorded = Array.isArray(fm[OL_FILES_KEY]) ? (fm[OL_FILES_KEY] as Json[]) : [];
+    for (const entry of [...recorded, fm[OL_PATH_KEY]]) {
+      const isEntry =
+        entry !== null && typeof entry === "object" && !Array.isArray(entry);
+      const path = isEntry ? (entry as JsonObject).path : entry;
+      const sha = isEntry ? (entry as JsonObject).sha : undefined;
+      if (!inScope(path) || seen.has(path)) {
+        continue;
+      }
+      seen.add(path);
+      if (isString(sha) && /^[0-9a-f]{40,64}$/i.test(sha)) {
+        owned.push({ path, sha });
+      } else {
+        unowned.push(path);
       }
     }
-    return result;
+    return { owned, unowned };
   }
 
   async publish(file: TFile): Promise<PublishPostResult> {
@@ -584,7 +607,7 @@ export default class Publisher<TFile extends { path: string }> {
       });
     }
     const currentPaths = files.map((f) => f.path);
-    const deletePaths = this.obsoletePaths(fm, currentPaths);
+    const obsolete = this.obsoleteFiles(fm, currentPaths);
     const previousBranch = fm[OL_BRANCH_KEY];
     const previousPr = fm[OL_PR_NUMBER_KEY];
     const result = await this.gateway.publishPost({
@@ -593,7 +616,7 @@ export default class Publisher<TFile extends { path: string }> {
           ? previousBranch.trim()
           : `obsidian/${post.slug}`,
       files,
-      deletePaths,
+      deleteFiles: obsolete.owned,
       title: post.title,
       pullRequestBody: [
         `Adds/updates the post **${post.title}** at \`${post.directory}/index.mdx\`.`,
@@ -608,13 +631,21 @@ export default class Publisher<TFile extends { path: string }> {
       [OL_BRANCH_KEY]: result.branch,
       [OL_PR_URL_KEY]: result.pullRequestUrl,
       [OL_PR_NUMBER_KEY]: result.pullRequestNumber,
-      [OL_FILES_KEY]: currentPaths,
+      [OL_FILES_KEY]: currentPaths.map((path) =>
+        result.fileShas[path]
+          ? { path, sha: result.fileShas[path] }
+          : path,
+      ),
     };
     if (!toIsoDate(this.fmValue(fm, "date"))) {
       // Pin the date so re-publishing doesn't move the post
       update[OL_DATE_KEY] = post.date;
     }
     await this.updateFrontmatter(file, update);
-    return result;
+    return {
+      ...result,
+      // Surface everything that was obsolete but left alone
+      deletesSkipped: [...result.deletesSkipped, ...obsolete.unowned],
+    };
   }
 }

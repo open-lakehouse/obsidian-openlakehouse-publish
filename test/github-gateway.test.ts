@@ -135,6 +135,11 @@ describe("GitHubGateway", () => {
         pullRequestCreated: true,
         filesWritten: [`${POST_DIR}/index.mdx`, `${POST_DIR}/diagram.png`],
         filesDeleted: [],
+        deletesSkipped: [],
+        fileShas: {
+          [`${POST_DIR}/index.mdx`]: github.file(TARGET, "obsidian/my-post", `${POST_DIR}/index.mdx`)!.sha,
+          [`${POST_DIR}/diagram.png`]: github.file(TARGET, "obsidian/my-post", `${POST_DIR}/diagram.png`)!.sha,
+        },
       });
     });
 
@@ -206,33 +211,95 @@ describe("GitHubGateway", () => {
     });
   });
 
-  describe("Deleting obsolete files", () => {
+  describe("Provenance: blob shas and deleting obsolete files", () => {
+    const png = `${POST_DIR}/diagram.png`;
+    const mdx = `${POST_DIR}/index.mdx`;
+    let first: Awaited<ReturnType<GitHubGateway["publishPost"]>>;
+
     beforeEach(async () => {
-      await gateway().publishPost(input());
+      first = await gateway().publishPost(input());
       github.requests = [];
     });
 
-    it("deletes requested paths from the branch with their sha", async () => {
-      const png = `${POST_DIR}/diagram.png`;
-      const sha = github.file(TARGET, "obsidian/my-post", png)!.sha;
+    it("reports the blob sha GitHub returned for each uploaded file on create", () => {
+      expect(first.fileShas).to.deep.equal({
+        [mdx]: github.file(TARGET, "obsidian/my-post", mdx)!.sha,
+        [png]: github.file(TARGET, "obsidian/my-post", png)!.sha,
+      });
+    });
+
+    it("reports the new sha for updated files and the existing sha for unchanged ones", async () => {
       const result = await gateway().publishPost(
-        input({ files: [input().files[0]], deletePaths: [png] }),
+        input({ files: [{ path: mdx, content: "changed\n" }, input().files[1]] }),
+      );
+      const newMdxSha = github.file(TARGET, "obsidian/my-post", mdx)!.sha;
+      expect(newMdxSha).to.not.equal(first.fileShas[mdx]);
+      expect(result.fileShas).to.deep.equal({ [mdx]: newMdxSha, [png]: first.fileShas[png] });
+      expect(result.filesWritten).to.deep.equal([mdx]);
+    });
+
+    it("deletes an obsolete file whose blob is unchanged since the plugin uploaded it", async () => {
+      const result = await gateway().publishPost(
+        input({ files: [input().files[0]], deleteFiles: [{ path: png, sha: first.fileShas[png] }] }),
       );
       const deletes = github.requestsMatching("DELETE", `/repos/${TARGET}/contents/`);
       expect(deletes).to.have.length(1);
-      expect(deletes[0].body).to.include({ sha, branch: "obsidian/my-post" });
+      expect(deletes[0].body).to.include({ sha: first.fileShas[png], branch: "obsidian/my-post" });
       expect(github.file(TARGET, "obsidian/my-post", png)).to.be.undefined;
-      expect(github.file(TARGET, "obsidian/my-post", `${POST_DIR}/index.mdx`)).to.exist;
       expect(result.filesDeleted).to.deep.equal([png]);
+      expect(result.deletesSkipped).to.be.empty;
+    });
+
+    it("does NOT delete a file modified on the branch (e.g. by a maintainer)", async () => {
+      // Maintainer edits the image on the branch
+      const branchFiles = github.repo(TARGET).files["obsidian/my-post"];
+      branchFiles[png] = { sha: "e".repeat(40), content: "ZWRpdGVk" };
+      const result = await gateway().publishPost(
+        input({ files: [input().files[0]], deleteFiles: [{ path: png, sha: first.fileShas[png] }] }),
+      );
+      expect(github.requestsMatching("DELETE", "/")).to.be.empty;
+      expect(github.file(TARGET, "obsidian/my-post", png)!.sha).to.equal("e".repeat(40));
+      expect(result.filesDeleted).to.be.empty;
+      expect(result.deletesSkipped).to.deep.equal([png]);
+    });
+
+    it("does NOT delete another post's file named with a sha that doesn't match", async () => {
+      const other = "src/content/posts/iceberg/other-post/index.mdx";
+      github.repo(TARGET).files["obsidian/my-post"][other] = { sha: "b".repeat(40), content: "" };
+      const result = await gateway().publishPost(
+        input({ deleteFiles: [{ path: other, sha: "a".repeat(40) }] }),
+      );
+      expect(github.file(TARGET, "obsidian/my-post", other)).to.exist;
+      expect(result.deletesSkipped).to.deep.equal([other]);
+    });
+
+    it("treats a concurrent change (409 on delete) as modified and leaves it", async () => {
+      const real = github.requestUrl;
+      const gw = new GitHubGateway(
+        { token: github.token, targetRepo: parseRepo(TARGET)!, baseBranch: "main" },
+        async (params) =>
+          params.method === "DELETE" ? { status: 409, json: Promise.resolve({ message: "sha mismatch" }) } : real(params),
+      );
+      const result = await gw.publishPost(
+        input({ files: [input().files[0]], deleteFiles: [{ path: png, sha: first.fileShas[png] }] }),
+      );
+      expect(result.deletesSkipped).to.deep.equal([png]);
+      expect(result.filesDeleted).to.be.empty;
     });
 
     it("skips paths that don't exist on the branch, and never deletes a path being written", async () => {
       const result = await gateway().publishPost(
-        input({ deletePaths: [`${POST_DIR}/gone.png`, `${POST_DIR}/index.mdx`] }),
+        input({
+          deleteFiles: [
+            { path: `${POST_DIR}/gone.png`, sha: "c".repeat(40) },
+            { path: mdx, sha: first.fileShas[mdx] },
+          ],
+        }),
       );
       expect(github.requestsMatching("DELETE", "/")).to.be.empty;
       expect(result.filesDeleted).to.be.empty;
-      expect(github.file(TARGET, "obsidian/my-post", `${POST_DIR}/index.mdx`)).to.exist;
+      expect(result.deletesSkipped).to.be.empty;
+      expect(github.file(TARGET, "obsidian/my-post", mdx)).to.exist;
     });
   });
 

@@ -75,6 +75,12 @@ export default class PublishToOpenLakehousePlugin extends Plugin {
                 `${result.pullRequestCreated ? "Opened" : "Updated"} pull request #${result.pullRequestNumber}\n${result.pullRequestUrl}`,
                 10000,
               );
+              if (result.deletesSkipped.length) {
+                new Notice(
+                  `Publish to OpenLakehouse: these files are no longer part of the post but were NOT deleted, because they were changed on the branch or weren't verifiably uploaded by this plugin. Remove them in the pull request if needed:\n${result.deletesSkipped.join("\n")}`,
+                  0,
+                );
+              }
             },
             (err) => {
               notice.hide();

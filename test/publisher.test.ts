@@ -7,6 +7,7 @@ import {
   createGatewayStubWithDefaults,
   createPublisher,
   defaultPublishResult,
+  fakeSha,
   FakeApp,
   FakeFile,
   FakeMetadataCache,
@@ -321,6 +322,10 @@ describe("Publisher", () => {
           branch: "obsidian/post",
           pullRequestNumber: 42,
           pullRequestUrl: `https://github.com/${TARGET}/pull/42`,
+          fileShas: {
+            "src/content/posts/iceberg/post/index.mdx": "1".repeat(40),
+            "src/content/posts/iceberg/post/pic.png": "2".repeat(40),
+          },
         }),
       );
       await publisher.publish(file);
@@ -346,60 +351,109 @@ describe("Publisher", () => {
         "ol-pr-url": `https://github.com/${TARGET}/pull/42`,
         "ol-pr-number": 42,
         "ol-files": [
-          "src/content/posts/iceberg/post/index.mdx",
-          "src/content/posts/iceberg/post/pic.png",
+          { path: "src/content/posts/iceberg/post/index.mdx", sha: "1".repeat(40) },
+          { path: "src/content/posts/iceberg/post/pic.png", sha: "2".repeat(40) },
         ],
         "ol-date": "2026-11-23",
       });
-      expect(gateway.publishPost.firstCall.args[0].deletePaths).to.deep.equal([]);
+      expect(gateway.publishPost.firstCall.args[0].deleteFiles).to.deep.equal([]);
     });
 
     describe("obsolete files", () => {
       const root = "src/content/posts/iceberg";
+      const sha = (c: string) => c.repeat(40);
 
-      it("asks to delete recorded files that are no longer part of the post", async () => {
+      it("passes obsolete files with their recorded sha to the gateway for deletion", async () => {
         const file = note("Body", {
           "ol-path": `${root}/post/index.mdx`,
-          "ol-files": [`${root}/post/index.mdx`, `${root}/post/old.png`, `${root}/post/thumbnail.png`],
+          "ol-files": [
+            { path: `${root}/post/index.mdx`, sha: sha("1") },
+            { path: `${root}/post/old.png`, sha: sha("2") },
+            { path: `${root}/post/thumbnail.png`, sha: sha("3") },
+          ],
         }, "Post.md");
-        await publisher.publish(file);
-        expect(gateway.publishPost.firstCall.args[0].deletePaths).to.deep.equal([
-          `${root}/post/old.png`,
-          `${root}/post/thumbnail.png`,
+        const result = await publisher.publish(file);
+        expect(gateway.publishPost.firstCall.args[0].deleteFiles).to.deep.equal([
+          { path: `${root}/post/old.png`, sha: sha("2") },
+          { path: `${root}/post/thumbnail.png`, sha: sha("3") },
         ]);
-        expect(file.frontmatter["ol-files"]).to.deep.equal([`${root}/post/index.mdx`]);
+        expect(result.deletesSkipped).to.be.empty;
+        expect(file.frontmatter["ol-files"]).to.deep.equal([
+          { path: `${root}/post/index.mdx`, sha: fakeSha(`${root}/post/index.mdx`) },
+        ]);
       });
 
-      it("deletes the old location after a slug or category change, even without ol-files", async () => {
+      it("never deletes legacy entries without provenance (plain strings, ol-path only) and reports them", async () => {
         const file = note("Body", {
           "ol-path": `${root}/old-slug/index.mdx`,
           "ol-category": "delta-lake",
           slug: "new-slug",
+          "ol-files": [`${root}/old-slug/index.mdx`, `${root}/old-slug/pic.png`],
         });
-        await publisher.publish(file);
+        const result = await publisher.publish(file);
         const args = gateway.publishPost.firstCall.args[0];
         expect(args.files.map((f) => f.path)).to.deep.equal([
           "src/content/posts/delta-lake/new-slug/index.mdx",
         ]);
-        expect(args.deletePaths).to.deep.equal([`${root}/old-slug/index.mdx`]);
+        expect(args.deleteFiles).to.deep.equal([]);
+        expect(result.deletesSkipped).to.deep.equal([
+          `${root}/old-slug/index.mdx`,
+          `${root}/old-slug/pic.png`,
+        ]);
+        // Migrated to the new format for the files of this publish
+        expect(file.frontmatter["ol-files"]).to.deep.equal([
+          {
+            path: "src/content/posts/delta-lake/new-slug/index.mdx",
+            sha: fakeSha("src/content/posts/delta-lake/new-slug/index.mdx"),
+          },
+        ]);
+      });
+
+      it("treats entries with a missing or malformed sha as unowned", async () => {
+        const file = note("Body", {
+          "ol-path": `${root}/post/index.mdx`,
+          "ol-files": [
+            { path: `${root}/post/a.png` },
+            { path: `${root}/post/b.png`, sha: "not-a-sha" },
+            { path: `${root}/post/c.png`, sha: 12 },
+          ],
+        }, "Post.md");
+        const result = await publisher.publish(file);
+        expect(gateway.publishPost.firstCall.args[0].deleteFiles).to.deep.equal([]);
+        expect(result.deletesSkipped).to.deep.equal([
+          `${root}/post/a.png`,
+          `${root}/post/b.png`,
+          `${root}/post/c.png`,
+        ]);
+      });
+
+      it("includes files the gateway refused to delete in deletesSkipped", async () => {
+        gateway.publishPost.resolves(defaultPublishResult({ deletesSkipped: [`${root}/post/edited.png`] }));
+        const file = note("Body", {
+          "ol-path": `${root}/post/index.mdx`,
+          "ol-files": [{ path: `${root}/post/edited.png`, sha: sha("4") }, `${root}/post/legacy.png`],
+        }, "Post.md");
+        const result = await publisher.publish(file);
+        expect(result.deletesSkipped).to.deep.equal([`${root}/post/edited.png`, `${root}/post/legacy.png`]);
       });
 
       it("ignores recorded paths outside the posts directory or with traversal", async () => {
         const file = note("Body", {
           "ol-path": `${root}/post/index.mdx`,
           "ol-files": [
-            "README.md",
-            "src/content/authors/me.mdx",
-            `${root}/post/../../../../../package.json`,
-            `${root}//x.png`,
+            { path: "README.md", sha: sha("5") },
+            { path: "src/content/authors/me.mdx", sha: sha("6") },
+            { path: `${root}/post/../../../../../package.json`, sha: sha("7") },
+            { path: `${root}//x.png`, sha: sha("8") },
             42,
-            `${root}/post/real.png`,
+            { path: `${root}/post/real.png`, sha: sha("9") },
           ],
         }, "Post.md");
-        await publisher.publish(file);
-        expect(gateway.publishPost.firstCall.args[0].deletePaths).to.deep.equal([
-          `${root}/post/real.png`,
+        const result = await publisher.publish(file);
+        expect(gateway.publishPost.firstCall.args[0].deleteFiles).to.deep.equal([
+          { path: `${root}/post/real.png`, sha: sha("9") },
         ]);
+        expect(result.deletesSkipped).to.be.empty;
       });
     });
 
@@ -456,6 +510,49 @@ describe("Publisher", () => {
       expect(github.requestsMatching("POST", `/repos/${TARGET}/git/refs`)).to.be.empty;
     });
 
+    it("after merge + branch recreation, deletes only files still byte-identical to the plugin's upload", async () => {
+      const github = new FakeGitHub();
+      const repo = github.addRepo(TARGET);
+      const gw = new GitHubGateway(
+        { token: github.token, targetRepo: parseRepo(TARGET)!, baseBranch: "main" },
+        github.requestUrl,
+      );
+      const p = createPublisher(app, gw);
+      const file = note("# Merged\n\n![[a.png]] ![[b.png]]", {}, "Merged.md");
+      app.metadataCache.setLinkTarget("a.png", file.path, image("a.png", [1]));
+      app.metadataCache.setLinkTarget("b.png", file.path, image("b.png", [2]));
+      await p.publish(file);
+
+      const dir = "src/content/posts/iceberg/merged";
+      const other = "src/content/posts/iceberg/someone-elses-post/index.mdx";
+      // The PR is merged, its branch deleted and the PR closed
+      repo.files.main = { ...repo.files.main, ...repo.files["obsidian/merged"] };
+      repo.branches.main = "9".repeat(40);
+      delete repo.branches["obsidian/merged"];
+      delete repo.files["obsidian/merged"];
+      github.pulls[TARGET][0].state = "closed";
+      // A maintainer then edits b.png on main, and another post exists
+      repo.files.main[`${dir}/b.png`] = { sha: "e".repeat(40), content: "bWFpbnRhaW5lcg==" };
+      repo.files.main[other] = { sha: "d".repeat(40), content: "" };
+      // ... and ol-files is hand-edited to name the other post
+      (file.frontmatter["ol-files"] as any[]).push({ path: other, sha: "a".repeat(40) });
+
+      // Both images are removed from the note
+      file.contents = "# Merged\n\nNo images any more";
+      const result = await p.publish(file);
+
+      const branchFiles = repo.files["obsidian/merged"];
+      expect(result.branchCreated).to.be.true;
+      expect(branchFiles[`${dir}/a.png`]).to.be.undefined; // unchanged plugin upload: deleted
+      expect(branchFiles[`${dir}/b.png`].sha).to.equal("e".repeat(40)); // maintainer edit: kept
+      expect(branchFiles[other]).to.exist; // sha mismatch: kept
+      expect(result.filesDeleted).to.deep.equal([`${dir}/a.png`]);
+      expect(result.deletesSkipped).to.deep.equal([`${dir}/b.png`, other]);
+      expect(file.frontmatter["ol-files"]).to.deep.equal([
+        { path: `${dir}/index.mdx`, sha: branchFiles[`${dir}/index.mdx`].sha },
+      ]);
+    });
+
     it("removes images, thumbnails and old directories on republish, but nothing it didn't upload", async () => {
       const github = new FakeGitHub();
       github.addRepo(TARGET);
@@ -488,7 +585,11 @@ describe("Publisher", () => {
       expect(Object.keys(github.repo(TARGET).files[branch]).sort()).to.deep.equal(
         [`${newDir}/a.png`, `${newDir}/index.mdx`, `${oldDir}/maintainer.png`],
       );
-      expect(file.frontmatter["ol-files"]).to.deep.equal([`${newDir}/index.mdx`, `${newDir}/a.png`]);
+      const branchFiles = github.repo(TARGET).files[branch];
+      expect(file.frontmatter["ol-files"]).to.deep.equal([
+        { path: `${newDir}/index.mdx`, sha: branchFiles[`${newDir}/index.mdx`].sha },
+        { path: `${newDir}/a.png`, sha: branchFiles[`${newDir}/a.png`].sha },
+      ]);
       expect(github.pulls[TARGET]).to.have.length(1);
     });
   });

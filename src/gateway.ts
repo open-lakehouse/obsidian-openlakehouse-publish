@@ -20,6 +20,9 @@ export type PublishFile = {
   content: string | ArrayBuffer;
 };
 
+/** A repository path and the git blob sha of the content the plugin uploaded */
+export type OwnedFile = { path: string; sha: string };
+
 export type PublishPostInput = {
   /** Branch on the head repository receiving the commits */
   branch: string;
@@ -28,11 +31,12 @@ export type PublishPostInput = {
   title: string;
   pullRequestBody: string;
   /**
-   * Repository paths uploaded by a previous run that are no longer part of
-   * the post. They are deleted from the branch if present. Callers must only
-   * pass paths they uploaded themselves.
+   * Files uploaded by a previous run that are no longer part of the post,
+   * with the git blob sha recorded when they were uploaded. A file is only
+   * deleted if the blob currently on the branch still has that sha, i.e. it
+   * still holds exactly what the plugin uploaded.
    */
-  deletePaths?: string[];
+  deleteFiles?: OwnedFile[];
   /** PR number written to frontmatter by a previous run, if any */
   previousPullRequestNumber?: number;
 };
@@ -49,6 +53,13 @@ export type PublishPostResult = {
   filesWritten: string[];
   /** Repository paths that were deleted from the branch */
   filesDeleted: string[];
+  /**
+   * Obsolete files that were NOT deleted because the branch holds different
+   * content than the plugin uploaded (e.g. edited by a maintainer).
+   */
+  deletesSkipped: string[];
+  /** Blob sha now on the branch for every file in `files` */
+  fileShas: Record<string, string>;
 };
 
 /**

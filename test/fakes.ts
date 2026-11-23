@@ -190,6 +190,13 @@ export class FakeApp implements GenericApp<FakeFile> {
   }
 }
 
+/** Deterministic 40-hex-character fake blob sha for a path */
+export const fakeSha = (path: string) => {
+  let h = 0;
+  for (const c of path) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return h.toString(16).padStart(8, "0").repeat(5);
+};
+
 export const defaultPublishResult = (
   input?: Partial<PublishPostResult>,
 ): PublishPostResult => ({
@@ -201,6 +208,8 @@ export const defaultPublishResult = (
   pullRequestCreated: true,
   filesWritten: [],
   filesDeleted: [],
+  deletesSkipped: [],
+  fileShas: {},
   ...input,
 });
 
@@ -210,7 +219,12 @@ export const createGatewayStubWithDefaults = () => {
     ReturnType<PublishGateway["publishPost"]>
   >();
   publishPost.callsFake(async (input) =>
-    defaultPublishResult({ branch: input.branch }),
+    defaultPublishResult({
+      branch: input.branch,
+      fileShas: Object.fromEntries(
+        input.files.map((f) => [f.path, fakeSha(f.path)]),
+      ),
+    }),
   );
   return { publishPost };
 };
