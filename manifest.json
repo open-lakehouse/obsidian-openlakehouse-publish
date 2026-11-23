@@ -1,11 +1,10 @@
 {
-	"id": "publish-to-dev",
-	"name": "Publish to DEV",
-	"version": "0.11.2",
+	"id": "publish-to-openlakehouse",
+	"name": "Publish to OpenLakehouse",
+	"version": "0.1.0",
 	"minAppVersion": "0.15.0",
-	"description": "Publish and update notes as articles on DEV (https://dev.to)",
-	"author": "Peter Strøiman",
-	"authorUrl": "https://stroiman.com",
-	"fundingUrl": "https://www.buymeacoffee.com/stroiman",
+	"description": "Publish notes as MDX blog posts to openlakehouse.io by opening a GitHub pull request.",
+	"author": "Open Lakehouse contributors (based on Publish to DEV by Peter Strøiman)",
+	"authorUrl": "https://openlakehouse.io",
 	"isDesktopOnly": false
 }

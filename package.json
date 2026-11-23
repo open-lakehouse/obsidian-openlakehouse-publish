@@ -1,7 +1,7 @@
 {
-  "name": "obsidian-sample-plugin",
-  "version": "0.11.2",
-  "description": "Obsidian plugin to publish obsidian notes to DEV",
+  "name": "publish-to-openlakehouse",
+  "version": "0.1.0",
+  "description": "Obsidian plugin to publish notes as MDX posts to openlakehouse.io via GitHub pull requests",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
@@ -17,7 +17,7 @@
     "spec": "test/**/*.ts"
   },
   "keywords": [],
-  "author": "",
+  "author": "Open Lakehouse contributors (based on obsidian-dev-publish by Peter Strøiman)",
   "license": "MIT",
   "devDependencies": {
     "@mdx-js/mdx": "^3",
