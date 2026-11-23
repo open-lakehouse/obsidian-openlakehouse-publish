@@ -40,10 +40,25 @@ on the active note. The plugin:
    | `ol-branch`    | `obsidian/my-post`                                        |
    | `ol-pr-url`    | `https://github.com/open-lakehouse/openlakehouse-io/pull/123` |
    | `ol-pr-number` | `123`                                                     |
+   | `ol-files`     | every repository path uploaded (index.mdx and images)     |
    | `ol-date`      | `2026-11-23` (only when the note has no `date`, to pin it) |
 
 Running the command again updates the same branch and pull request. If the
 pull request was closed or merged, a new one is opened from the same branch.
+
+On re-publish, files the plugin uploaded before (listed in `ol-files`, plus the
+`ol-path` index.mdx) that are no longer part of the post are deleted from the
+branch: removed images, a removed `thumbnail.*`, and the old directory's files
+after a slug or category change. Files the plugin didn't upload are never
+deleted.
+
+When publishing from a fork whose base branch is behind the target, the plugin
+syncs the fork's base branch (GitHub's "Sync fork") so that new post branches
+always start at the target's current base commit. If the fork's base branch
+has diverged and can't be synced, publishing stops with an error; sync or reset
+the fork on GitHub and try again.
+
+Publishing the same note again while a publish is still running is refused.
 
 ## Setup
 
@@ -139,18 +154,19 @@ bookkeeping keys, …) is left out of the post.
   `> **Title**` (or the callout type when there's no title).
 - **Autolinks:** `<https://example.com>` (not supported by MDX) becomes
   `[https://example.com](https://example.com)`.
+- **Indented code blocks** (not supported by MDX) are converted to fenced code
+  blocks with their contents unchanged, also inside lists and blockquotes.
 - **MDX escaping:** `{`, `}` and `<` in prose are escaped (`\{`, `\}`,
-  `&lt;`), so a note that happens to contain them still compiles. Fenced code
-  blocks and inline code are left untouched. This also means raw HTML/JSX
+  `&lt;`), so a note that happens to contain them still compiles. The note is
+  parsed as CommonMark + GFM (like Obsidian renders it), and code (including
+  fences nested in lists and blockquotes), inline code, link and image
+  destinations, reference definitions and bare URLs are left untouched. This also means raw HTML/JSX
   in a note is shown as text rather than rendered.
 
 ## Known limitations
 
 - Every file is its own commit (the Contents API writes one file per commit).
   Squash-merging the pull request keeps `main` tidy.
-- Files removed from a note (e.g. a deleted image) are not deleted from the
-  branch. Renaming the slug or category creates a new post directory; the old
-  one stays on the branch.
 - If the post branch already exists, it is not rebased onto the latest base
   branch.
 - Wikilinks to headings link to the post, not to the heading.
